@@ -1,0 +1,118 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Inter:wght@300;400;500;600;700&display=swap');
+@import 'ag-grid-community/styles/ag-grid.css';
+@import 'ag-grid-community/styles/ag-theme-quartz.css';
+
+:root {
+  font-family: 'Outfit', 'Inter', system-ui, -apple-system, sans-serif;
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background-color: #070a13;
+  color: #f3f4f6;
+  min-height: 100vh;
+  overflow-x: hidden;
+  background-image: 
+    radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.15) 0px, transparent 50%),
+    radial-gradient(at 100% 0%, rgba(6, 182, 212, 0.12) 0px, transparent 50%),
+    radial-gradient(at 50% 100%, rgba(79, 70, 229, 0.08) 0px, transparent 50%);
+  background-attachment: fixed;
+}
+
+/* Custom Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0b0f19;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #1f2937;
+  border-radius: 9999px;
+  border: 2px solid #0b0f19;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #4f46e5;
+}
+
+/* Custom glassmorphism hover animations */
+.glow-card {
+  position: relative;
+  overflow: hidden;
+}
+
+.glow-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.1) 0%, rgba(6, 182, 212, 0.1) 100%);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.glow-card:hover::before {
+  opacity: 1;
+}
+
+/* Glass panel background */
+.glass-panel {
+  background: rgba(17, 24, 39, 0.6) !important;
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+}
+
+/* AG Grid Dark Theme Overrides for Quartz Dark */
+.ag-theme-quartz.ag-theme-quartz-dark {
+  --ag-background-color: rgba(17, 24, 39, 0.6) !important;
+  --ag-header-background-color: rgba(11, 15, 25, 0.85) !important;
+  --ag-row-hover-color: rgba(99, 102, 241, 0.15) !important;
+  --ag-selected-row-background-color: rgba(99, 102, 241, 0.25) !important;
+  --ag-odd-row-background-color: rgba(255, 255, 255, 0.01) !important;
+  --ag-border-color: rgba(255, 255, 255, 0.08) !important;
+  --ag-font-family: 'Inter', system-ui, sans-serif !important;
+  --ag-font-size: 13.5px !important;
+  --ag-header-column-separator-display: none !important;
+  --ag-foreground-color: #f3f4f6 !important;
+  --ag-header-foreground-color: #ffffff !important;
+  --ag-data-color: #f3f4f6 !important;
+  border-radius: 12px !important;
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15) !important;
+}
+
+.ag-theme-quartz.ag-theme-quartz-dark .ag-header {
+  border-top-left-radius: 11px !important;
+  border-top-right-radius: 11px !important;
+  border-bottom: 2px solid rgba(99, 102, 241, 0.4) !important;
+}
+
+.ag-theme-quartz.ag-theme-quartz-dark .ag-row {
+  border-bottom-color: rgba(255, 255, 255, 0.05) !important;
+}
+
+.ag-theme-quartz.ag-theme-quartz-dark .ag-cell {
+  display: flex !important;
+  align-items: center !important;
+}
+
+/* Fade-in transitions */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.fade-in-section {
+  animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
