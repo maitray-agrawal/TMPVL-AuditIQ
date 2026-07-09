@@ -1,9 +1,19 @@
 import datetime
 import uuid
-from sqlalchemy import Column, String, Date, DateTime, Float, Integer, ForeignKey, JSON
+from sqlalchemy import Column, String, Date, DateTime, Float, Integer, ForeignKey, JSON as SQL_JSON, TypeDecorator
 from sqlalchemy.orm import relationship
 from sqlalchemy.ext.hybrid import hybrid_property
 from backend.app.core.db import Base
+from backend.app.core.json_util import make_json_serializable
+
+class SafeJSON(TypeDecorator):
+    impl = SQL_JSON
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        return make_json_serializable(value)
+
+JSON = SafeJSON
 
 class Trainee(Base):
     __tablename__ = "trainees"

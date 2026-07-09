@@ -10,6 +10,7 @@ from backend.app.repositories.repositories import (
     AuditLogRepository
 )
 from backend.app.models.models import Trainee, PaymentLedger, InvoiceRecord, ValidationResult
+from backend.app.core.json_util import make_json_serializable
 
 # Import new rules
 from backend.app.services.rules import (
@@ -341,7 +342,7 @@ class ValidationService:
 
             record.fraud_score = fraud_score
             record.fraud_category = fraud_cat
-            record.validation_summary = state["record_results"]
+            record.validation_summary = make_json_serializable(state["record_results"])
             record.reason = "; ".join(f["message"] for f in state["record_results"]) if state["record_results"] else None
 
             # Determine aggregate status for this record based on flags

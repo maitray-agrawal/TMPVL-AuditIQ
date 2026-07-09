@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from backend.app.repositories.repositories import TraineeRepository, InvoiceRepository, AuditLogRepository
 from backend.app.models.models import Trainee, InvoiceRecord, SeparationRecord, BDCRecord, PaymentLedger, ValidationResult, UploadHistory, TraineeLifecycle, Invoice, InvoiceItem
 from backend.app.services.workbook_parser import WorkbookParser
+from backend.app.core.json_util import make_json_serializable
 
 class ImportService:
     @staticmethod
@@ -442,7 +443,7 @@ class ImportService:
                             ext_data["email"] = r_email
                             for k, val in unknown_data.items():
                                 ext_data[k] = val
-                            trainee.extra_data = ext_data
+                            trainee.extra_data = make_json_serializable(ext_data)
 
                             trainee.current_workbook = file_name
                             trainee.current_sheet = sheet_name
@@ -514,7 +515,7 @@ class ImportService:
                                     ext_changed = True
                                     
                             if ext_changed:
-                                trainee.extra_data = ext_data
+                                trainee.extra_data = make_json_serializable(ext_data)
                                 changed = True
 
                             if trainee.current_workbook != file_name or trainee.current_sheet != sheet_name:

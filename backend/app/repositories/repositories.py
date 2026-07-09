@@ -12,6 +12,7 @@ from backend.app.models.models import (
     AuditLog,
     UploadHistory
 )
+from backend.app.core.json_util import make_json_serializable
 
 
 class TraineeRepository:
@@ -301,7 +302,7 @@ class LedgerRepository:
             payment_type=payment_type,
             amount_paid=amount_paid,
             payment_date=payment_date,
-            extra_data=extra_data
+            extra_data=make_json_serializable(extra_data)
         )
         db.add(entry)
         if commit:
@@ -424,8 +425,8 @@ class AuditLogRepository:
             failed=failed,
             warnings=warnings,
             errors=errors,
-            before_state=before_state,
-            after_state=after_state,
+            before_state=make_json_serializable(before_state),
+            after_state=make_json_serializable(after_state),
             employee_id=employee_id,
             invoice_number=invoice_number,
             upload_id=upload_id
