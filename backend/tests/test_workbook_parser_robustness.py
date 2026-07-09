@@ -81,7 +81,7 @@ class TestWorkbookParserRobustness(unittest.TestCase):
         
         self.assertEqual(len(result["sheets"]), 1)
         parsed = result["sheets"][0]
-        self.assertEqual(parsed["sheet_type"], "Generic")
+        self.assertEqual(parsed["sheet_type"], "Unknown")
         self.assertEqual(parsed["normalized_headers"], ["department", "expensecode", "amountclaimed"])
         self.assertEqual(len(parsed["rows"]), 2)
         # Verify float conversion works on generic columns containing 'amount'

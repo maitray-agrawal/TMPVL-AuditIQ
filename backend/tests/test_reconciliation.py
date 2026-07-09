@@ -395,11 +395,11 @@ class TestInvoiceReconciliation(unittest.TestCase):
         # Seed Trainees
         # Today DOJ, active
         t1 = Trainee(id="T_DB_1", name="Active 1", doj=datetime.date.today(), scheme="B.Tech", status="ACTIVE")
-        # Today DOL, early exit (DOJ was 15 days ago)
+        # Today DOL, early exit (DOJ is today, so same month and under 30 days)
         t2 = Trainee(
             id="T_DB_2",
             name="Early Exit",
-            doj=datetime.date.today() - datetime.timedelta(days=15),
+            doj=datetime.date.today(),
             dol=datetime.date.today(),
             scheme="NAPS",
             status="SEPARATED"

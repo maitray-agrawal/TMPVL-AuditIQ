@@ -131,67 +131,100 @@ class InvoiceRepository:
 
     @staticmethod
     def get_unique_invoices(db: Session) -> List[dict]:
-        # Fetch all columns needed in a single query
-        all_records = db.query(
-            InvoiceRecord.invoice_number,
-            InvoiceRecord.invoice_date,
-            InvoiceRecord.status,
-            InvoiceRecord.file_name,
-            InvoiceRecord.uploaded_at,
-            InvoiceRecord.billed_total_amount,
-            InvoiceRecord.approved_total_amount
-        ).all()
-
-        if not all_records:
-            return []
-
-        # Aggregate stats in memory (O(N) time complexity)
-        groups = {}
-        for r in all_records:
-            inv_num = r.invoice_number
-            if inv_num not in groups:
-                groups[inv_num] = {
-                    "invoice_number": inv_num,
-                    "invoice_date": r.invoice_date,
-                    "file_name": r.file_name,
-                    "uploaded_at": r.uploaded_at,
-                    "billed_amount": 0.0,
-                    "approved_amount": 0.0,
-                    "record_count": 0,
-                    "statuses": []
-                }
-            g = groups[inv_num]
-            g["billed_amount"] += r.billed_total_amount
-            g["approved_amount"] += r.approved_total_amount
-            g["record_count"] += 1
-            g["statuses"].append(r.status)
-
+        from backend.app.models.models import Invoice, InvoiceItem
+        
+        invoices = db.query(Invoice).order_by(Invoice.uploaded_at.desc()).all()
         results = []
-        for g in groups.values():
-            statuses = g["statuses"]
-            # Resolve status precedence rule:
-            # EXCEPTION > PENDING > VALIDATED > APPROVED
+        processed_inv_numbers = set()
+        
+        for inv in invoices:
+            processed_inv_numbers.add(inv.invoice_number)
+            items_stats = db.query(
+                InvoiceItem.status,
+                InvoiceItem.claimed_amount,
+                InvoiceItem.approved_amount
+            ).filter(InvoiceItem.invoice_id == inv.invoice_id).all()
+            
+            record_count = len(items_stats)
+            statuses = [item.status for item in items_stats]
+            
             if "EXCEPTION" in statuses:
-                status = "EXCEPTION"
+                legacy_status = "EXCEPTION"
             elif "PENDING" in statuses:
-                status = "PENDING"
+                legacy_status = "PENDING"
             elif "VALIDATED" in statuses:
-                status = "VALIDATED"
+                legacy_status = "VALIDATED"
             elif "APPROVED" in statuses:
-                status = "APPROVED"
+                legacy_status = "APPROVED"
             else:
-                status = "PENDING"
-
+                legacy_status = "PENDING"
+                
             results.append({
-                "invoice_number": g["invoice_number"],
-                "invoice_date": g["invoice_date"],
-                "status": status,
-                "file_name": g["file_name"],
-                "uploaded_at": g["uploaded_at"],
-                "billed_amount": g["billed_amount"],
-                "approved_amount": g["approved_amount"],
-                "record_count": g["record_count"]
+                "invoice_id": inv.invoice_id,
+                "invoice_number": inv.invoice_number,
+                "invoice_date": inv.invoice_date,
+                "billing_month": inv.billing_month,
+                "billing_year": inv.billing_year,
+                "vendor_name": inv.vendor_name,
+                "status": legacy_status,
+                "ledger_status": inv.status,
+                "file_name": inv.workbook_name,
+                "uploaded_at": inv.uploaded_at,
+                "billed_amount": inv.total_amount,
+                "approved_amount": inv.approved_amount,
+                "rejected_amount": inv.rejected_amount,
+                "fraud_amount": inv.fraud_amount,
+                "record_count": record_count,
+                "remarks": inv.remarks
             })
+            
+        # Fallback: process any invoice_number in invoice_items that wasn't covered by parent invoices
+        fallback_query = db.query(InvoiceItem)
+        if processed_inv_numbers:
+            fallback_query = fallback_query.filter(~InvoiceItem.invoice_number.in_(processed_inv_numbers))
+        fallback_items = fallback_query.all()
+        
+        from collections import defaultdict
+        grouped = defaultdict(list)
+        for item in fallback_items:
+            grouped[item.invoice_number].append(item)
+            
+        for inv_num, items in sorted(grouped.items()):
+            first_item = items[0]
+            billed_sum = sum(i.claimed_amount or i.billed_total_amount or 0.0 for i in items)
+            approved_sum = sum(i.approved_amount or i.approved_total_amount or 0.0 for i in items)
+            
+            statuses = [item.status for item in items]
+            if "EXCEPTION" in statuses:
+                legacy_status = "EXCEPTION"
+            elif "PENDING" in statuses:
+                legacy_status = "PENDING"
+            elif "VALIDATED" in statuses:
+                legacy_status = "VALIDATED"
+            elif "APPROVED" in statuses:
+                legacy_status = "APPROVED"
+            else:
+                legacy_status = "PENDING"
+                
+            results.append({
+                "invoice_id": None,
+                "invoice_number": inv_num,
+                "invoice_date": first_item.invoice_date,
+                "billing_month": None,
+                "billing_year": None,
+                "vendor_name": "Tata Projects",
+                "status": legacy_status,
+                "ledger_status": "ACTIVE",
+                "file_name": first_item.file_name,
+                "uploaded_at": first_item.uploaded_at,
+                "billed_amount": billed_sum,
+                "approved_amount": approved_sum,
+                "rejected_amount": max(0.0, billed_sum - approved_sum),
+                "fraud_amount": 0.0,
+                "record_count": len(items),
+                "remarks": None
+            })
+            
         return results
 
     @staticmethod
@@ -217,6 +250,11 @@ class InvoiceRepository:
             record.approved_180_days_amount = approved_180
             record.approved_total_amount = approved_joining + approved_180
             record.status = status
+            
+            # Update new schema fields
+            record.approved_amount = approved_joining + approved_180
+            record.rejected_amount = max(0.0, record.claimed_amount - record.approved_amount)
+            
             if commit:
                 db.commit()
                 db.refresh(record)
@@ -360,7 +398,8 @@ class AuditLogRepository:
         after_state: Optional[dict] = None,
         employee_id: Optional[str] = None,
         invoice_number: Optional[str] = None,
-        timestamp: Optional[datetime.datetime] = None
+        timestamp: Optional[datetime.datetime] = None,
+        upload_id: Optional[str] = None
     ) -> AuditLog:
         log = AuditLog(
             action=action,
@@ -379,7 +418,8 @@ class AuditLogRepository:
             before_state=before_state,
             after_state=after_state,
             employee_id=employee_id,
-            invoice_number=invoice_number
+            invoice_number=invoice_number,
+            upload_id=upload_id
         )
         if timestamp:
             log.timestamp = timestamp

@@ -75,12 +75,12 @@ class TestWorkbookParser(unittest.TestCase):
         
         # Verify Generic sheet parsing
         metadata_sheet = sheets_map["Metadata"]
-        self.assertEqual(metadata_sheet["sheet_type"], "Generic")
+        self.assertEqual(metadata_sheet["sheet_type"], "Unknown")
         self.assertEqual(metadata_sheet["valid_rows"], 1)
         
         # Verify BDC sheet parsing
         bdc_sheet = sheets_map["BDC Trainees"]
-        self.assertEqual(bdc_sheet["sheet_type"], "BDC")
+        self.assertEqual(bdc_sheet["sheet_type"], "Employee Master")
         self.assertEqual(bdc_sheet["valid_rows"], 3)  # Row 2, Row 3, Row 4
         
         rows = bdc_sheet["rows"]

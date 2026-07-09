@@ -160,6 +160,8 @@ python -m backend.main
 ```
 ```
 set PYTHONPATH=.python -m backend.main
+PYTHONPATH=. .venv/bin/python -m pytest backend/tests
+
 ```
 
 **Frontend Client**:

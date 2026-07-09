@@ -481,6 +481,63 @@ export const EmployeeMaster: React.FC = () => {
 
               <Divider sx={{ borderColor: 'rgba(255,255,255,0.08)', mb: 3 }} />
 
+              {/* Invoice Claims History */}
+              <Box sx={{ mb: 3 }}>
+                <Typography variant="subtitle1" sx={{ fontWeight: 700, mb: 1.5, display: 'flex', alignItems: 'center', gap: 1 }}>
+                  <History size={18} color="#f43f5e" /> Invoice Claims History
+                </Typography>
+                {(!details.invoice_timeline || details.invoice_timeline.length === 0) ? (
+                  <Typography variant="body2" sx={{ color: 'text.secondary', py: 1 }}>
+                    No invoice claims logged.
+                  </Typography>
+                ) : (
+                  <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
+                    {details.invoice_timeline.map((item: any) => (
+                      <Box 
+                        key={item.id}
+                        sx={{ 
+                          p: 1.5,
+                          borderRadius: 2,
+                          background: 'rgba(255, 255, 255, 0.01)',
+                          border: '1px solid rgba(255, 255, 255, 0.05)',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: 0.5
+                        }}
+                      >
+                        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <Typography variant="body2" sx={{ fontWeight: 700, color: '#f43f5e' }}>
+                            Invoice: {item.invoice_number}
+                          </Typography>
+                          <Chip 
+                            label={item.status} 
+                            size="small" 
+                            color={item.status === 'APPROVED' ? 'success' : item.status === 'FRAUD' ? 'error' : item.status === 'PARTIALLY_APPROVED' ? 'warning' : 'default'}
+                            sx={{ height: 18, fontSize: '0.65rem', fontWeight: 700 }}
+                          />
+                        </Box>
+                        <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                          Date: {item.invoice_date}
+                        </Typography>
+                        <Typography variant="body2" sx={{ fontSize: '0.8rem' }}>
+                          Claimed: ₹{item.claimed_amount} | Approved: ₹{item.approved_amount} | Rejected: ₹{item.rejected_amount}
+                        </Typography>
+                        <Typography variant="body2" sx={{ fontSize: '0.8rem', color: 'text.secondary' }}>
+                          Risk Score: <span style={{ fontWeight: 700, color: item.fraud_score > 50 ? '#ef4444' : item.fraud_score > 20 ? '#f59e0b' : '#10b981' }}>{item.fraud_score} ({item.fraud_category})</span>
+                        </Typography>
+                        {item.reason && (
+                          <Typography variant="body2" sx={{ fontSize: '0.8rem', color: 'error.main', mt: 0.5 }}>
+                            Reason: {item.reason}
+                          </Typography>
+                        )}
+                      </Box>
+                    ))}
+                  </Box>
+                )}
+              </Box>
+
+              <Divider sx={{ borderColor: 'rgba(255,255,255,0.08)', mb: 3 }} />
+
               {/* Audit Warnings */}
               <Box>
                 <Typography variant="subtitle1" sx={{ fontWeight: 700, mb: 1.5, display: 'flex', alignItems: 'center', gap: 1 }}>

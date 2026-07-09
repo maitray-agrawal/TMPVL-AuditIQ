@@ -6,20 +6,71 @@ from typing import Dict, List, Tuple, Any, Optional
 import pandas as pd
 
 class WorkbookParser:
-    # Header keywords for classification
-    ID_KWS = ['traineeid', 'empid', 'employeeid', 'regno', 'persno', 'pno', 'personnelno', 'personnelnumber', 'persnumber', 'employeenumber', 'traineenumber', 'id', 'emp_id', 'employee_id']
-    NAME_KWS = ['completename', 'completname', 'traineename', 'employeename', 'name', 'firstname', 'fullname']
-    DOJ_KWS = ['doj', 'dateofjoining', 'joiningdate', 'begda', 'begdaddmmyyyym', 'joining']
-    DOL_KWS = ['dol', 'dateofleaving', 'leavingdate', 'resignationdate', 'separationdate']
-    TICKET_KWS = ['ticket', 'ticketno', 'ticketnumber', 'boardingticket', 'ticketid', 'tktno', 'tktnumber']
-    
+    PARSER_VERSION = "2.0.0"
+
+    # Synonym dictionary mapping standard business keys to list of lowercase alphanumeric synonyms
+    SYNONYMS = {
+        "trainee_id": [
+            "traineeid", "empid", "employeeid", "regno", "persno", "pno", "personnelno", 
+            "personnelnumber", "persnumber", "employeenumber", "traineenumber", "id", 
+            "emp_id", "employee_id", "trainee_id", "reg_no", "regno"
+        ],
+        "ticket_number": [
+            "ticket", "ticketno", "ticketnumber", "boardingticket", "ticketid", "tktno", 
+            "tktnumber", "boardingticketno", "ticket_number", "ticket_no"
+        ],
+        "joining_date": [
+            "begdaddmmyyyym", "begda", "joiningdate", "doj", "startdate", 
+            "dateofjoining", "joining"
+        ],
+        "end_date": [
+            "enddaddmmyyyym", "leavingdate", "enddate", "dol", "dateofleaving", 
+            "resignationdate", "separationdate"
+        ],
+        "candidate_name": [
+            "completename", "employeename", "candidatename", "name", 
+            "traineename", "fullname", "candidatesname", "employeename"
+        ],
+        "first_name": ["firstname", "first_name"],
+        "middle_name": ["middlename", "middle_name"],
+        "last_name": ["lastname", "last_name"],
+        "aadhaar": [
+            "aadhaar", "adhaar", "aadhar", "uid", "uidai", "nationalid", 
+            "adharcard", "aadharcard", "aadhaarcard"
+        ],
+        "mobile": [
+            "mobile", "mobileno", "mobilenumber", "phone", "phoneno", 
+            "contact", "contactno", "contactnumber", "telephoneno", "telephonenumber"
+        ],
+        "email": ["email", "emailid", "emailaddress", "mail", "mailid"],
+        "category": [
+            "category", "traineecategory", "empcategory", "employeecategory", 
+            "scheme", "program", "course", "type"
+        ],
+        "batch": ["batch", "group", "batchname", "year", "joiningbatch"],
+        "shop": [
+            "shop", "department", "dept", "location", "workarea", "area", 
+            "unit", "plant", "shopfloor"
+        ],
+        "reason": [
+            "reason", "remarks", "typeofseparation", "reasonforaction", 
+            "reasonfortermination", "separationreason"
+        ],
+        "offer_id": [
+            "offerid", "offerletterid", "offerletternumber", "offerno", 
+            "offernumber", "offer_id"
+        ]
+    }
+
     # Invoice specific headers
     INVOICE_KWS = [
         'joiningpayment', 'joiningreimbursement', 'joiningamount',
         '180days', '180dayspayment', '180daysreimbursement', '180daysamount',
         'uniform', 'shirt', 'jeans', 'excess', 'billingstage', 'stage',
         'claimedamount', 'billedtotal', 'totalamount', 'shirtquantity',
-        'shirtqty', 'jeanquanity', 'jeanqty', 'jeansquantity', 'jeansqty'
+        'shirtqty', 'jeanquanity', 'jeanqty', 'jeansquantity', 'jeansqty',
+        'amount', 'billamount', 'billingamount', 'pair', 'uniformpair', 'kitpair',
+        'distributiondate', 'issueddate', 'pageno', 'page'
     ]
 
     @staticmethod
@@ -54,6 +105,9 @@ class WorkbookParser:
                 continue
             for norm_kw in normalized_keywords:
                 if norm_kw and (norm_kw in norm_h or norm_h in norm_kw):
+                    # Skip matching generic "name" to specific first/middle/last name fields
+                    if norm_kw == "name" and any(p in norm_h for p in ("first", "middle", "last")):
+                        continue
                     return idx
         return None
 
@@ -78,8 +132,11 @@ class WorkbookParser:
                 if 30000 < num_val < 60000:
                     return pd.to_datetime(num_val, unit='D', origin='1899-12-30').date()
             
+            # Clean string format
+            val_str = val_str.split(' ')[0]
+            
             # Try parsing with explicit format-guessing (preferred in Indian context)
-            for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d.%m.%Y", "%d/%m/%y", "%d-%m-%y", "%d%m%Y", "%d%m%y"):
+            for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d.%m.%Y", "%d/%m/%y", "%d-%m-%y", "%d%m%Y", "%d%m%y", "%Y%m%d", "%Y/%m/%d"):
                 try:
                     return datetime.datetime.strptime(val_str, fmt).date()
                 except ValueError:
@@ -121,52 +178,98 @@ class WorkbookParser:
             return 0.0
 
     @classmethod
-    def detect_sheet_type_and_header(cls, ws) -> Tuple[Optional[str], Optional[int], List[str]]:
+    def detect_sheet_type_and_header(cls, ws) -> Tuple[str, float, Optional[int], List[str]]:
         """
-        Scans first 15 rows of worksheet to detect if it is BDC, Separation, or Invoice sheet.
-        If not matched, detects first row with at least 2 non-numeric, non-empty text cells as a Generic sheet.
-        Returns (sheet_type, header_row_index_0_based, original_headers).
+        Scans first 50 rows of worksheet to detect if it is Employee Master, Separation, Invoice, or Unknown.
+        Scores each row to find the highest confidence header row.
+        Returns (sheet_type, confidence, header_row_index_0_based, original_headers).
         """
-        # Read the first 15 rows
-        rows_sample = list(ws.iter_rows(max_row=15, values_only=True))
+        # Read the first 50 rows
+        rows_sample = list(ws.iter_rows(max_row=50, values_only=True))
         
-        # 1. Try to detect specific types first
+        best_idx = None
+        best_score = -1.0
+        best_sheet_type = "Unknown"
+        best_confidence = 0.22
+        best_headers = []
+        
         for idx, row in enumerate(rows_sample):
             if not row or all(c is None or str(c).strip() == "" for c in row):
                 continue
             
             # Clean cells in row (resolving formula errors to None)
             row_cleaned = [None if (isinstance(c, str) and c.startswith('#')) else c for c in row]
-            if all(c is None or str(c).strip() == "" for c in row_cleaned):
+            non_empty_cells = [c for c in row_cleaned if c is not None and str(c).strip() != ""]
+            if len(non_empty_cells) < 2:
                 continue
-
-            headers_normalized = [cls.normalize_header(c) for c in row_cleaned if c is not None]
-            if not headers_normalized:
-                continue
-
-            # Check matches
-            has_id = any(cls.normalize_header(c) in cls.ID_KWS for c in row_cleaned if c)
-            has_ticket = any(cls.normalize_header(c) in cls.TICKET_KWS for c in row_cleaned if c)
-            has_name = any(cls.normalize_header(c) in cls.NAME_KWS for c in row_cleaned if c)
-            has_doj = any(cls.normalize_header(c) in cls.DOJ_KWS for c in row_cleaned if c)
-            has_dol = any(cls.normalize_header(c) in cls.DOL_KWS for c in row_cleaned if c)
-            has_invoice_marker = any(cls.normalize_header(c) in cls.INVOICE_KWS for c in row_cleaned if c)
-            
-            original_headers = [str(c).strip() if c is not None else "" for c in row]
-
-            # 1. Separation Checks: Trainee ID/Ticket + DOL
-            if (has_id or has_ticket) and has_dol:
-                return "Separation", idx, original_headers
                 
-            # 2. BDC Checks: Trainee ID/Ticket + Name + DOJ
-            if (has_id or has_ticket) and has_name and has_doj:
-                return "BDC", idx, original_headers
-
-            # 3. Invoice Checks: Trainee ID/Ticket + Invoice Marker or Total
-            if (has_id or has_ticket) and (has_invoice_marker or 'total' in headers_normalized):
-                return "Invoice", idx, original_headers
-
-        # 2. Fall back to Generic detection
+            # Count synonym matches
+            has_id = any(cls.normalize_header(c) in cls.SYNONYMS["trainee_id"] for c in row_cleaned if c)
+            has_ticket = any(cls.normalize_header(c) in cls.SYNONYMS["ticket_number"] for c in row_cleaned if c)
+            has_joining = any(cls.normalize_header(c) in cls.SYNONYMS["joining_date"] for c in row_cleaned if c)
+            has_end_date = any(cls.normalize_header(c) in cls.SYNONYMS["end_date"] for c in row_cleaned if c)
+            has_name = any(
+                cls.normalize_header(c) in cls.SYNONYMS["candidate_name"] or 
+                cls.normalize_header(c) in cls.SYNONYMS["first_name"] 
+                for c in row_cleaned if c
+            )
+            has_reason = any(cls.normalize_header(c) in cls.SYNONYMS["reason"] for c in row_cleaned if c)
+            has_invoice_marker = any(
+                cls.normalize_header(c) in cls.INVOICE_KWS
+                for c in row_cleaned if c
+            )
+            has_total = any(cls.normalize_header(c) == "total" for c in row_cleaned if c)
+            
+            # Text cells count (non-numeric)
+            text_cells = 0
+            for cell in row_cleaned:
+                val = str(cell).strip() if cell is not None else ""
+                if val:
+                    try:
+                        float(val)
+                    except ValueError:
+                        text_cells += 1
+                        
+            # Scoring
+            score = 0.0
+            if has_id or has_ticket:
+                score += 10.0
+            if has_joining:
+                score += 5.0
+            if has_end_date:
+                score += 5.0
+            if has_name:
+                score += 5.0
+            if has_reason:
+                score += 5.0
+            if has_invoice_marker or has_total:
+                score += 5.0
+            score += text_cells * 0.5
+            
+            # Determine classification for this row
+            row_type = "Unknown"
+            row_conf = 0.22
+            if (has_id or has_ticket) and has_end_date and has_reason:
+                row_type = "Separation"
+                row_conf = 0.99
+            elif (has_id or has_ticket) and has_joining and has_name:
+                row_type = "Employee Master"
+                row_conf = 0.98
+            elif (has_id or has_ticket) and (has_invoice_marker or has_total):
+                row_type = "Invoice"
+                row_conf = 0.95
+                
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+                best_sheet_type = row_type
+                best_confidence = row_conf
+                best_headers = [str(c).strip() if c is not None else "" for c in row]
+                
+        if best_idx is not None and best_score > 0.0:
+            return best_sheet_type, best_confidence, best_idx, best_headers
+            
+        # Fall back to detecting a header row (first row with at least 2 non-numeric text cells)
         for idx, row in enumerate(rows_sample):
             if not row:
                 continue
@@ -176,15 +279,14 @@ class WorkbookParser:
                 val = str(cell).strip() if cell is not None else ""
                 original_headers.append(val)
                 if val and not val.startswith('#'):
-                    # Check if not numeric
                     try:
                         float(val)
                     except ValueError:
                         text_cells_count += 1
             if text_cells_count >= 2:
-                return "Generic", idx, original_headers
-
-        return None, None, []
+                return "Unknown", 0.22, idx, original_headers
+                
+        return "Unknown", 0.22, None, []
 
     @classmethod
     def get_merged_cells_map(cls, ws) -> Dict[Tuple[int, int], Any]:
@@ -212,10 +314,13 @@ class WorkbookParser:
     def parse_workbook(cls, file_content: bytes, file_name: str) -> Dict[str, Any]:
         """
         Main parser entry point.
-        Loads workbook, detects types (supporting standard BDC/Separation/Invoice and Generic types),
+        Loads workbook, detects types (supporting standard BDC/Separation/Invoice and Unknown types),
         normalizes values, ignores empty/hidden worksheets, and returns stats + structured data.
+        Optimized for memory usage with read_only mode for files > 10MB.
         """
-        wb = openpyxl.load_workbook(io.BytesIO(file_content), read_only=False, data_only=True)
+        # Determine if we should load read-only (files larger than 10MB)
+        is_large_file = len(file_content) > 10 * 1024 * 1024
+        wb = openpyxl.load_workbook(io.BytesIO(file_content), read_only=is_large_file, data_only=True)
         
         stats = {
             "workbook_name": file_name,
@@ -260,17 +365,12 @@ class WorkbookParser:
 
             try:
                 # 3. Detect sheet type and header row
-                sheet_type, header_idx, original_headers = cls.detect_sheet_type_and_header(ws)
+                sheet_type, confidence, header_idx, original_headers = cls.detect_sheet_type_and_header(ws)
                 
-                if not sheet_type:
-                    stats["skipped_sheets"].append(sheet_name)
-                    stats["warnings"].append(f"Sheet '{sheet_name}' skipped: Unknown sheet type (could not detect headers).")
-                    continue
-
                 stats["sheets_processed"].append(sheet_name)
 
-                # Get merged cells map
-                merged_cells_map = cls.get_merged_cells_map(ws)
+                # Get merged cells map if not in read_only mode
+                merged_cells_map = {} if is_large_file else cls.get_merged_cells_map(ws)
 
                 # Setup headers mappings, handling blank/empty headers and duplicate headers
                 normalized_headers = []
@@ -288,22 +388,35 @@ class WorkbookParser:
                     
                     normalized_headers.append(norm_h)
                 
+                # Schema Fingerprinting & Caching column mappings
+                import hashlib
+                fingerprint = hashlib.sha256(",".join(normalized_headers).encode('utf-8')).hexdigest()
+                
+                if not hasattr(cls, "_SCHEMA_CACHE"):
+                    cls._SCHEMA_CACHE = {}
+                col_mapping = cls._SCHEMA_CACHE.get(fingerprint)
+                if col_mapping is None:
+                    col_mapping = {}
+                    for std_key, syn_list in cls.SYNONYMS.items():
+                        col_mapping[std_key] = cls._find_column_index(original_headers, syn_list)
+                    cls._SCHEMA_CACHE[fingerprint] = col_mapping
+
                 rows_data = []
                 blank_rows_count = 0
                 valid_rows_count = 0
 
                 # 4. Read all data rows after the header row
-                start_row = header_idx + 2  # next row after header row
-                max_r = ws.max_row
-
-                for r in range(start_row, max_r + 1):
+                start_row = header_idx + 2  # next row after header row (1-indexed)
+                
+                # In read_only mode, we can't write, but we can read using ws.iter_rows
+                for r_idx, row in enumerate(ws.iter_rows(min_row=start_row, values_only=False), start=start_row):
                     row_cells = []
-                    # Get values for row, checking merged cells map first
-                    for c in range(1, len(original_headers) + 1):
-                        if (r, c) in merged_cells_map:
-                            val = merged_cells_map[(r, c)]
+                    for c_idx, cell in enumerate(row, start=1):
+                        val = None
+                        if not is_large_file and (r_idx, c_idx) in merged_cells_map:
+                            val = merged_cells_map[(r_idx, c_idx)]
                         else:
-                            val = ws.cell(row=r, column=c).value
+                            val = cell.value
                         row_cells.append(val)
 
                     # Normalize cell values for formula errors
@@ -319,42 +432,73 @@ class WorkbookParser:
                         blank_rows_count += 1
                         continue
 
-                    # Create normalized row mapping
+                    # Create row dict
                     row_dict = {}
+                    
+                    # 1. Put original normalized headers (backward compatibility)
                     for idx, norm_h in enumerate(normalized_headers):
                         if not norm_h:
                             continue
                         val = row_cleaned[idx] if idx < len(row_cleaned) else None
                         
-                        # Apply specific normalizations based on column types
-                        # ID normalization
-                        if any(k in norm_h for k in cls.ID_KWS):
+                        # Apply original normalizations
+                        if any(k in norm_h for k in cls.SYNONYMS["trainee_id"] + cls.SYNONYMS["ticket_number"]):
                             row_dict[norm_h] = cls.clean_trainee_id(val)
-                        # Ticket normalization
-                        elif any(k in norm_h for k in cls.TICKET_KWS):
-                            row_dict[norm_h] = str(val).strip() if val is not None else ""
-                        # Numeric normalization
                         elif any(k in norm_h for k in ['amount', 'payment', 'reimbursement', 'qty', 'quantity', 'total', 'shirt', 'jeans', 'uniform', 'other']):
                             row_dict[norm_h] = cls.parse_float(val)
-                        # Date normalization
-                        elif any(k in norm_h for k in cls.DOJ_KWS + cls.DOL_KWS + ['date']):
+                        elif any(k in norm_h for k in cls.SYNONYMS["joining_date"] + cls.SYNONYMS["end_date"] + ['date']):
                             row_dict[norm_h] = cls.parse_date(val)
-                        # Default string normalization
                         else:
                             row_dict[norm_h] = str(val).strip() if val is not None else ""
 
-                    # Save raw index and clean values
-                    row_dict["_row_num"] = r
+                    # 2. Put standard business keys dynamically based on synonyms using the cached col_mapping
+                    for std_key, col_idx in col_mapping.items():
+                        if col_idx is not None:
+                            matched_val = row_cleaned[col_idx] if col_idx < len(row_cleaned) else None
+                            if std_key in ("joining_date", "end_date"):
+                                row_dict[std_key] = cls.parse_date(matched_val)
+                            elif std_key in ("trainee_id", "ticket_number", "offer_id"):
+                                row_dict[std_key] = cls.clean_trainee_id(matched_val)
+                            elif std_key in ("aadhaar", "mobile"):
+                                val_str = str(matched_val).strip() if matched_val is not None else ""
+                                val_str = re.sub(r'[\s\-]', '', val_str)
+                                if val_str.endswith(".0"):
+                                    val_str = val_str[:-2]
+                                row_dict[std_key] = val_str
+                            else:
+                                row_dict[std_key] = str(matched_val).strip() if matched_val is not None else ""
+                        else:
+                            if std_key in ("joining_date", "end_date"):
+                                row_dict[std_key] = None
+                            else:
+                                row_dict[std_key] = ""
+
+                    # 3. Complete Name Fallback
+                    if not row_dict.get("candidate_name"):
+                        first = row_dict.get("first_name", "")
+                        middle = row_dict.get("middle_name", "")
+                        last = row_dict.get("last_name", "")
+                        full_name = " ".join([part for part in [first, middle, last] if part]).strip()
+                        if full_name:
+                            row_dict["candidate_name"] = full_name
+                            # Write back to normalized headers if applicable
+                            for name_h in ['completename', 'traineename', 'name', 'employeename']:
+                                if name_h in normalized_headers:
+                                    row_dict[name_h] = full_name
+
+                    # Raw row index
+                    row_dict["_row_num"] = r_idx
                     rows_data.append(row_dict)
                     valid_rows_count += 1
 
                 parsed_sheets.append({
                     "sheet_name": sheet_name,
                     "sheet_type": sheet_type,
+                    "confidence": confidence,
                     "original_headers": original_headers,
                     "normalized_headers": normalized_headers,
                     "rows": rows_data,
-                    "total_rows": max_r,
+                    "total_rows": start_row + len(rows_data) + blank_rows_count - 1,
                     "valid_rows": valid_rows_count,
                     "blank_rows": blank_rows_count
                 })
@@ -367,5 +511,6 @@ class WorkbookParser:
         
         return {
             "stats": stats,
-            "sheets": parsed_sheets
+            "sheets": parsed_sheets,
+            "parser_version": cls.PARSER_VERSION
         }

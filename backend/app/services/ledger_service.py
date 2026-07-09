@@ -67,8 +67,12 @@ class LedgerService:
         audit_details = []
 
         for r in records:
-            # Update status to APPROVED
-            r.status = "APPROVED"
+            # Skip posting to ledger if the item is FRAUD or REJECTED
+            if r._status in ("FRAUD", "REJECTED", "EXCEPTION"):
+                continue
+                
+            if r._status == "VALIDATED":
+                r.status = "APPROVED"
 
             # Get current payment summary for trainee
             payment_summary = cls.get_trainee_payment_summary(db, r.trainee_id)

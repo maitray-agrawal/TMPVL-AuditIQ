@@ -12,6 +12,10 @@ from backend.app.services.rules.rule_kit_limit import RuleKitLimit
 from backend.app.services.rules.rule_separation_checks import RuleSeparationChecks
 from backend.app.services.rules.rule_multiple_submissions import RuleMultipleSubmissions
 from backend.app.services.rules.rule_amount_mismatch import RuleAmountMismatch
+from backend.app.services.rules.rule_inactive_employee import RuleInactiveEmployee
+from backend.app.services.rules.rule_metadata_mismatch import RuleMetadataMismatch
+from backend.app.services.rules.rule_chronology import RuleChronology
+from backend.app.services.rules.rule_cross_invoice import RuleCrossInvoice
 
 __all__ = [
     "BaseRule",
@@ -28,5 +32,9 @@ __all__ = [
     "RuleKitLimit",
     "RuleSeparationChecks",
     "RuleMultipleSubmissions",
-    "RuleAmountMismatch"
+    "RuleAmountMismatch",
+    "RuleInactiveEmployee",
+    "RuleMetadataMismatch",
+    "RuleChronology",
+    "RuleCrossInvoice"
 ]

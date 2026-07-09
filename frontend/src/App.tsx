@@ -19,6 +19,7 @@ import { PaymentLedger } from './pages/PaymentLedger';
 import { Reports } from './pages/Reports';
 import { AuditLogs } from './pages/AuditLogs';
 import { Settings } from './pages/Settings';
+import { UploadHistory } from './pages/UploadHistory';
 
 const App: React.FC = () => {
   const [currentPage, setCurrentPage] = useState<string>('dashboard');
@@ -35,6 +36,8 @@ const App: React.FC = () => {
         return <SeparationUpload />;
       case 'upload_invoice':
         return <InvoiceUpload onPageChange={setCurrentPage} />;
+      case 'upload_history':
+        return <UploadHistory />;
       case 'validation':
         return <ValidationEngine />;
       case 'reconciliation':

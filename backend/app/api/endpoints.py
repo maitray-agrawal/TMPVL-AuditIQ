@@ -12,7 +12,7 @@ import datetime
 from io import BytesIO
 from typing import List, Optional, Dict, Any
 
-from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, Query
+from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, Query, Header
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
@@ -31,9 +31,19 @@ from backend.app.services.validation_service import ValidationService
 from backend.app.services.ledger_service import LedgerService
 from backend.app.services.report_service import ReportService
 from backend.app.services.workbook_parser import WorkbookParser
-from backend.app.models.models import Trainee, InvoiceRecord, ValidationResult, PaymentLedger
+from backend.app.models.models import Trainee, InvoiceRecord, ValidationResult, PaymentLedger, UploadHistory, TraineeLifecycle
+import uuid
 
 router = APIRouter()
+
+def get_offline_user() -> str:
+    import os
+    import platform
+    try:
+        return os.getlogin()
+    except Exception:
+        return os.environ.get("USER") or os.environ.get("USERNAME") or platform.node() or "Administrator"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -47,20 +57,23 @@ _MAX_LOG_LIMIT = 500
 _MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
 
 
-def _assert_excel(filename: str) -> None:
-    """Raise 400 if the uploaded file is not a recognised Excel format."""
+def _assert_file_extension(filename: str, allowed_extensions: set) -> None:
+    """Raise 400 if the uploaded file is not a recognised format."""
     ext = os.path.splitext(filename or "")[-1].lower()
-    if ext not in _EXCEL_EXTENSIONS:
+    if ext not in allowed_extensions:
+        ext_str = ", ".join(allowed_extensions)
         raise HTTPException(
             status_code=400,
-            detail="Only Excel files (.xlsx, .xls) are accepted."
+            detail=f"Only files with extensions {ext_str} are accepted."
         )
 
 
-async def _read_upload_safely(file: UploadFile) -> tuple:
+async def _read_upload_safely(file: UploadFile, allowed_extensions: Optional[set] = None) -> tuple:
     """Validate upload file, enforce size limit, and return (content, safe_filename)."""
     filename = file.filename or "upload.xlsx"
-    _assert_excel(filename)
+    if allowed_extensions is None:
+        allowed_extensions = _EXCEL_EXTENSIONS
+    _assert_file_extension(filename, allowed_extensions)
 
     content = await file.read()
     if len(content) > _MAX_UPLOAD_BYTES:
@@ -427,12 +440,34 @@ def get_trainee_details(trainee_id: str, db: Session = Depends(get_db)):
         for v in violations
     ]
 
+    # Format invoice timeline
+    from backend.app.models.models import InvoiceItem
+    timeline_items = db.query(InvoiceItem).filter(InvoiceItem.trainee_id == trainee_id).all()
+    timeline_items.sort(key=lambda x: x.invoice_date or datetime.date.min)
+    invoice_timeline = [
+        {
+            "id": item.id,
+            "invoice_number": item.invoice_number,
+            "invoice_date": item.invoice_date.strftime("%Y-%m-%d") if item.invoice_date else "",
+            "claimed_amount": item.claimed_amount,
+            "approved_amount": item.approved_amount,
+            "rejected_amount": item.rejected_amount,
+            "status": item._status,
+            "reason": item.reason,
+            "validation_summary": item.validation_summary,
+            "fraud_score": item.fraud_score,
+            "fraud_category": item.fraud_category,
+        }
+        for item in timeline_items
+    ]
+
     return {
         "profile": _format_trainee(trainee),
         "payment_history": history_list,
         "payment_summary": payment_summary,
         "separation_history": separation_history,
         "violations": violations_list,
+        "invoice_timeline": invoice_timeline,
     }
 
 
@@ -489,10 +524,15 @@ def unblock_trainee(trainee_id: str, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 
 @router.post("/uploads/bdc")
-async def upload_bdc(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def upload_bdc(
+    file: UploadFile = File(...),
+    upload_mode: str = Form("INCREMENTAL"),
+    admin: str = Depends(get_offline_user),
+    db: Session = Depends(get_db)
+):
     content, filename = await _read_upload_safely(file)
     try:
-        return ImportService.import_bdc_workbook(db, content, filename)
+        return ImportService.import_bdc_workbook(db, content, filename, upload_mode=upload_mode, operator=admin)
     except HTTPException:
         raise
     except Exception as exc:
@@ -501,10 +541,14 @@ async def upload_bdc(file: UploadFile = File(...), db: Session = Depends(get_db)
 
 
 @router.post("/uploads/separation")
-async def upload_separation(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def upload_separation(
+    file: UploadFile = File(...),
+    admin: str = Depends(get_offline_user),
+    db: Session = Depends(get_db)
+):
     content, filename = await _read_upload_safely(file)
     try:
-        return ImportService.import_separation_workbook(db, content, filename)
+        return ImportService.import_separation_workbook(db, content, filename, operator=admin)
     except HTTPException:
         raise
     except Exception as exc:
@@ -517,9 +561,10 @@ async def upload_invoice(
     file: UploadFile = File(...),
     invoice_number: Optional[str] = Form(None),
     invoice_date: Optional[str] = Form(None),
+    admin: str = Depends(get_offline_user),
     db: Session = Depends(get_db),
 ):
-    content, filename = await _read_upload_safely(file)
+    content, filename = await _read_upload_safely(file, allowed_extensions={".xlsx", ".xls", ".pdf"})
 
     inv_date: Optional[datetime.date] = None
     if invoice_date:
@@ -538,6 +583,7 @@ async def upload_invoice(
             file_name=filename,
             invoice_number_override=invoice_number,
             invoice_date_override=inv_date,
+            operator=admin
         )
     except HTTPException:
         raise
@@ -731,6 +777,148 @@ def delete_invoice(invoice_number: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@router.get("/invoices/compare/{invoice_a}/{invoice_b}")
+def compare_invoices(invoice_a: str, invoice_b: str, db: Session = Depends(get_db)):
+    from backend.app.models.models import InvoiceItem
+    
+    items_a = db.query(InvoiceItem).filter(InvoiceItem.invoice_number == invoice_a).all()
+    items_b = db.query(InvoiceItem).filter(InvoiceItem.invoice_number == invoice_b).all()
+    
+    if not items_a:
+        raise HTTPException(status_code=404, detail=f"Invoice '{invoice_a}' not found or has no records.")
+    if not items_b:
+        raise HTTPException(status_code=404, detail=f"Invoice '{invoice_b}' not found or has no records.")
+        
+    map_a = {item.trainee_id or item.ticket_number: item for item in items_a}
+    map_b = {item.trainee_id or item.ticket_number: item for item in items_b}
+    
+    added = []
+    removed = []
+    changed = []
+    common_count = 0
+    
+    for key, item_b in map_b.items():
+        if key not in map_a:
+            added.append({
+                "trainee_id": item_b.trainee_id,
+                "ticket_number": item_b.ticket_number,
+                "name": item_b.candidate_name,
+                "billed_joining": item_b.billed_joining_amount,
+                "billed_180_days": item_b.billed_180_days_amount,
+                "billed_total": item_b.claimed_amount
+            })
+        else:
+            common_count += 1
+            item_a = map_a[key]
+            if abs(item_b.claimed_amount - item_a.claimed_amount) > 0.01:
+                changed.append({
+                    "trainee_id": item_b.trainee_id,
+                    "ticket_number": item_b.ticket_number,
+                    "name": item_b.candidate_name,
+                    "a_billed": item_a.claimed_amount,
+                    "b_billed": item_b.claimed_amount,
+                    "diff": item_b.claimed_amount - item_a.claimed_amount
+                })
+                
+    for key, item_a in map_a.items():
+        if key not in map_b:
+            removed.append({
+                "trainee_id": item_a.trainee_id,
+                "ticket_number": item_a.ticket_number,
+                "name": item_a.candidate_name,
+                "billed_joining": item_a.billed_joining_amount,
+                "billed_180_days": item_a.billed_180_days_amount,
+                "billed_total": item_a.claimed_amount
+            })
+            
+    return {
+        "invoice_a_number": invoice_a,
+        "invoice_b_number": invoice_b,
+        "added_employees": added,
+        "removed_employees": removed,
+        "changed_employees": changed,
+        "common_count": common_count,
+        "invoice_a_total": sum(item.claimed_amount for item in items_a),
+        "invoice_b_total": sum(item.claimed_amount for item in items_b)
+    }
+
+
+@router.get("/invoices/{invoice_number}/reconciliation")
+def get_invoice_reconciliation(invoice_number: str, db: Session = Depends(get_db)):
+    from backend.app.models.models import InvoiceItem, PaymentLedger, Invoice
+    
+    items = db.query(InvoiceItem).filter(InvoiceItem.invoice_number == invoice_number).all()
+    if not items:
+        raise HTTPException(status_code=404, detail=f"Invoice '{invoice_number}' not found.")
+        
+    trainee_ids = [item.trainee_id for item in items if item.trainee_id]
+    
+    # Batch query ledger and other invoices
+    ledger_entries = db.query(PaymentLedger).filter(PaymentLedger.trainee_id.in_(trainee_ids)).all() if trainee_ids else []
+    ledger_map = {}
+    for entry in ledger_entries:
+        ledger_map.setdefault(entry.trainee_id, []).append(entry)
+        
+    other_items = db.query(InvoiceItem).join(Invoice).filter(
+        InvoiceItem.trainee_id.in_(trainee_ids),
+        InvoiceItem.invoice_number != invoice_number,
+        Invoice.status == "ACTIVE"
+    ).all() if trainee_ids else []
+    
+    other_claims_map = {}
+    for item in other_items:
+        other_claims_map.setdefault(item.trainee_id, []).append(item)
+        
+    reconciliation_details = []
+    
+    for item in items:
+        t_id = item.trainee_id
+        t_ledger = ledger_map.get(t_id, []) if t_id else []
+        t_other = other_claims_map.get(t_id, []) if t_id else []
+        
+        already_paid_joining = sum(h.amount_paid for h in t_ledger if h.payment_type == "JOINING")
+        already_paid_180 = sum(h.amount_paid for h in t_ledger if h.payment_type == "180_DAYS")
+        
+        already_claimed_joining = sum(c.billed_joining_amount for c in t_other)
+        already_claimed_180 = sum(c.billed_180_days_amount for c in t_other)
+        
+        # Reconciliation status derivation
+        rec_status = "CLEARED"
+        if item._status == "FRAUD":
+            rec_status = "FRAUD_SUSPECT"
+        elif (item.billed_joining_amount > 0 and (already_paid_joining > 0 or already_claimed_joining > 0)) or \
+             (item.billed_180_days_amount > 0 and (already_paid_180 > 0 or already_claimed_180 > 0)):
+            rec_status = "DOUBLE_BILLED"
+        elif item._status == "REJECTED":
+            rec_status = "REJECTED"
+        elif item._status == "PARTIALLY_APPROVED":
+            rec_status = "PARTIALLY_APPROVED"
+        elif item.approved_amount < item.claimed_amount:
+            rec_status = "OUTSTANDING"
+            
+        reconciliation_details.append({
+            "id": item.id,
+            "trainee_id": item.trainee_id,
+            "name": item.candidate_name,
+            "billed_total": item.claimed_amount,
+            "approved_total": item.approved_amount,
+            "already_paid_joining": already_paid_joining,
+            "already_paid_180": already_paid_180,
+            "already_claimed_joining": already_claimed_joining,
+            "already_claimed_180": already_claimed_180,
+            "reconciliation_status": rec_status,
+            "status": item._status,
+            "fraud_score": item.fraud_score,
+            "fraud_category": item.fraud_category
+        })
+        
+    return {
+        "invoice_number": invoice_number,
+        "total_records": len(items),
+        "details": reconciliation_details
+    }
+
+
 # ---------------------------------------------------------------------------
 # PAYMENT LEDGER
 # ---------------------------------------------------------------------------
@@ -770,8 +958,80 @@ def _excel_streaming_response(file_bytes: bytes, filename: str) -> StreamingResp
     )
 
 
+@router.get("/reports/invoice-history")
+def download_invoice_history(admin: str = Depends(get_offline_user), db: Session = Depends(get_db)):
+    try:
+        file_bytes = ReportService.generate_invoice_history_report(db)
+        return _excel_streaming_response(file_bytes, "invoice_history_report.xlsx")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/reports/monthly-billing-summary")
+def download_monthly_billing_summary(admin: str = Depends(get_offline_user), db: Session = Depends(get_db)):
+    try:
+        file_bytes = ReportService.generate_monthly_billing_summary_report(db)
+        return _excel_streaming_response(file_bytes, "monthly_billing_summary_report.xlsx")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/reports/duplicate-billing")
+def download_duplicate_billing(admin: str = Depends(get_offline_user), db: Session = Depends(get_db)):
+    try:
+        file_bytes = ReportService.generate_duplicate_billing_report(db)
+        return _excel_streaming_response(file_bytes, "duplicate_billing_report.xlsx")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/reports/repeated-payments")
+def download_repeated_payments(admin: str = Depends(get_offline_user), db: Session = Depends(get_db)):
+    try:
+        file_bytes = ReportService.generate_repeated_payment_report(db)
+        return _excel_streaming_response(file_bytes, "repeated_payments_report.xlsx")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/reports/outstanding-payments")
+def download_outstanding_payments(admin: str = Depends(get_offline_user), db: Session = Depends(get_db)):
+    try:
+        file_bytes = ReportService.generate_outstanding_payment_report(db)
+        return _excel_streaming_response(file_bytes, "outstanding_payments_report.xlsx")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/reports/invoice-comparison/{invoice_a}/{invoice_b}")
+def download_invoice_comparison(invoice_a: str, invoice_b: str, admin: str = Depends(get_offline_user), db: Session = Depends(get_db)):
+    try:
+        file_bytes = ReportService.generate_invoice_comparison_report(db, invoice_a, invoice_b)
+        return _excel_streaming_response(file_bytes, f"comparison_{invoice_a}_vs_{invoice_b}.xlsx")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/reports/vendor-summary")
+def download_vendor_summary(admin: str = Depends(get_offline_user), db: Session = Depends(get_db)):
+    try:
+        file_bytes = ReportService.generate_vendor_summary_report(db)
+        return _excel_streaming_response(file_bytes, "vendor_summary_report.xlsx")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/reports/employee-billing-history")
+def download_employee_billing_history(admin: str = Depends(get_offline_user), db: Session = Depends(get_db)):
+    try:
+        file_bytes = ReportService.generate_employee_billing_history_report(db)
+        return _excel_streaming_response(file_bytes, "employee_billing_history_report.xlsx")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @router.get("/reports/approved-invoice/{invoice_number}")
-def download_approved_invoice(invoice_number: str, db: Session = Depends(get_db)):
+def download_approved_invoice(invoice_number: str, admin: str = Depends(get_offline_user), db: Session = Depends(get_db)):
     try:
         file_bytes = ReportService.generate_approved_invoice_excel(db, invoice_number)
         return _excel_streaming_response(file_bytes, f"approved_invoice_{invoice_number}.xlsx")
@@ -785,6 +1045,7 @@ def download_approved_invoice(invoice_number: str, db: Session = Depends(get_db)
 def download_exception_report(
     invoice_number: Optional[str] = None,
     format_version: str = "legacy",
+    admin: str = Depends(get_offline_user),
     db: Session = Depends(get_db),
 ):
     try:
@@ -800,6 +1061,7 @@ def download_exception_report(
 @router.get("/reports/fraud")
 def download_fraud_report(
     invoice_number: Optional[str] = None,
+    admin: str = Depends(get_offline_user),
     db: Session = Depends(get_db)
 ):
     try:
@@ -816,6 +1078,7 @@ def download_fraud_report(
 def download_payment_summary(
     invoice_number: Optional[str] = None,
     format_version: str = "legacy",
+    admin: str = Depends(get_offline_user),
     db: Session = Depends(get_db)
 ):
     try:
@@ -831,6 +1094,7 @@ def download_payment_summary(
 @router.get("/reports/rejected-invoice/{invoice_number}")
 def download_rejected_invoice(
     invoice_number: str,
+    admin: str = Depends(get_offline_user),
     db: Session = Depends(get_db)
 ):
     try:
@@ -845,6 +1109,7 @@ def download_rejected_invoice(
 @router.get("/reports/finance-summary")
 def download_finance_summary(
     invoice_number: Optional[str] = None,
+    admin: str = Depends(get_offline_user),
     db: Session = Depends(get_db)
 ):
     try:
@@ -858,7 +1123,7 @@ def download_finance_summary(
 
 
 @router.get("/reports/corrected-invoice/{invoice_number}")
-def download_corrected_invoice(invoice_number: str, db: Session = Depends(get_db)):
+def download_corrected_invoice(invoice_number: str, admin: str = Depends(get_offline_user), db: Session = Depends(get_db)):
     try:
         file_bytes = ReportService.generate_corrected_invoice_excel(db, invoice_number)
         return _excel_streaming_response(file_bytes, f"corrected_invoice_{invoice_number}.xlsx")
@@ -869,7 +1134,7 @@ def download_corrected_invoice(invoice_number: str, db: Session = Depends(get_db
 
 
 @router.get("/reports/vendor-payment-summary/{invoice_number}")
-def download_vendor_payment_summary(invoice_number: str, db: Session = Depends(get_db)):
+def download_vendor_payment_summary(invoice_number: str, admin: str = Depends(get_offline_user), db: Session = Depends(get_db)):
     try:
         file_bytes = ReportService.generate_vendor_payment_summary_excel(db, invoice_number)
         return _excel_streaming_response(file_bytes, f"vendor_payment_summary_{invoice_number}.xlsx")
@@ -880,7 +1145,7 @@ def download_vendor_payment_summary(invoice_number: str, db: Session = Depends(g
 
 
 @router.get("/reports/audit-logs")
-def download_audit_logs(db: Session = Depends(get_db)):
+def download_audit_logs(admin: str = Depends(get_offline_user), db: Session = Depends(get_db)):
     try:
         file_bytes = ReportService.generate_audit_report_excel(db)
         return _excel_streaming_response(file_bytes, "system_audit_logs.xlsx")
@@ -891,7 +1156,7 @@ def download_audit_logs(db: Session = Depends(get_db)):
 
 
 @router.get("/reports/finance-analytics")
-def get_finance_analytics(db: Session = Depends(get_db)):
+def get_finance_analytics(admin: str = Depends(get_offline_user), db: Session = Depends(get_db)):
     """Retrieve all consolidated financial metrics and savings in JSON format."""
     try:
         return ReportService.get_finance_analytics_data(db)
@@ -903,6 +1168,7 @@ def get_finance_analytics(db: Session = Depends(get_db)):
 def export_finance_analytics(
     format: str = Query(default="excel", pattern="^(excel|csv|pdf)$"),
     metric: str = Query(default="summary"),
+    admin: str = Depends(get_offline_user),
     db: Session = Depends(get_db)
 ):
     """Export the consolidated finance analytics report in Excel, PDF, or CSV format."""
@@ -934,6 +1200,154 @@ def export_finance_analytics(
             )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/reports/validation-errors")
+def download_validation_errors(
+    invoice_number: Optional[str] = None,
+    admin: str = Depends(get_offline_user),
+    db: Session = Depends(get_db)
+):
+    """Generate downloadable Excel report of row-level errors for Trainees and Invoices."""
+    import openpyxl
+    from openpyxl.styles import Font, Alignment, PatternFill
+    
+    query = db.query(ValidationResult)
+    if invoice_number:
+        query = query.join(InvoiceRecord).filter(InvoiceRecord.invoice_number == invoice_number)
+    results = query.all()
+    
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Validation Errors"
+    ws.views.sheetView[0].showGridLines = True
+    
+    headers = ["Sheet", "Row", "Ticket", "Employee", "Rule", "Reason", "Suggested Fix", "Severity"]
+    ws.append(headers)
+    
+    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    header_font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    
+    ws.row_dimensions[1].height = 25
+    
+    for res in results:
+        sheet_val = "N/A"
+        row_val = "N/A"
+        ticket_val = "N/A"
+        emp_name = "N/A"
+        
+        trainee = None
+        if res.trainee_id:
+            trainee = db.query(Trainee).filter(Trainee.id == res.trainee_id).first()
+        elif res.invoice_record_id:
+            inv_rec = db.query(InvoiceRecord).filter(InvoiceRecord.id == res.invoice_record_id).first()
+            if inv_rec and inv_rec.trainee_id:
+                trainee = db.query(Trainee).filter(Trainee.id == inv_rec.trainee_id).first()
+                sheet_val = inv_rec.file_name or "N/A"
+                if inv_rec.extra_data:
+                    row_val = inv_rec.extra_data.get("_row_num") or "N/A"
+        
+        if trainee:
+            ticket_val = trainee.ticket_number or "N/A"
+            emp_name = trainee.name or "N/A"
+            if sheet_val == "N/A":
+                sheet_val = trainee.current_sheet or "N/A"
+            if row_val == "N/A" and trainee.extra_data:
+                row_val = trainee.extra_data.get("_row_num") or "N/A"
+                
+        ws.append([
+            sheet_val,
+            row_val,
+            ticket_val,
+            emp_name,
+            res.rule_name,
+            res.message,
+            res.recommended_action or "N/A",
+            res.status
+        ])
+        
+    for col in ws.columns:
+        max_len = 0
+        for cell in col:
+            val = str(cell.value or '')
+            if len(val) > max_len:
+                max_len = len(val)
+        col_letter = openpyxl.utils.get_column_letter(col[0].column)
+        ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
+        
+    out = BytesIO()
+    wb.save(out)
+    out.seek(0)
+    
+    return _excel_streaming_response(out.getvalue(), "validation_errors_report.xlsx")
+
+
+@router.get("/uploads/history")
+def get_upload_history(
+    upload_type: Optional[str] = None,
+    query: Optional[str] = None,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    admin: str = Depends(get_offline_user),
+    db: Session = Depends(get_db)
+):
+    """Retrieve permanent upload history logs for the dashboard."""
+    q = db.query(UploadHistory)
+    if upload_type:
+        q = q.filter(UploadHistory.upload_type == upload_type)
+    if query:
+        search_filter = f"%{query}%"
+        q = q.filter(
+            or_(
+                UploadHistory.file_name.like(search_filter),
+                UploadHistory.uploaded_by.like(search_filter),
+                UploadHistory.remarks.like(search_filter)
+            )
+        )
+    total = q.count()
+    uploads = q.order_by(UploadHistory.upload_time.desc()).offset(offset).limit(limit).all()
+    
+    return {
+        "total": total,
+        "uploads": [
+            {
+                "upload_id": u.upload_id,
+                "file_name": u.file_name,
+                "file_hash": u.file_hash,
+                "file_size": u.file_size,
+                "upload_type": u.upload_type,
+                "uploaded_by": u.uploaded_by,
+                "upload_time": u.upload_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "processing_time": u.processing_time,
+                "status": u.status,
+                "is_duplicate": u.is_duplicate,
+                "workbook_version": u.workbook_version,
+                "parser_version": u.parser_version,
+                "application_version": u.application_version,
+                "sheet_count": u.sheet_count,
+                "visible_sheet_count": u.visible_sheet_count,
+                "hidden_sheet_count": u.hidden_sheet_count,
+                "rows_processed": u.rows_processed,
+                "rows_inserted": u.rows_inserted,
+                "rows_updated": u.rows_updated,
+                "rows_no_change": u.rows_no_change,
+                "rows_skipped": u.rows_skipped,
+                "rows_failed": u.rows_failed,
+                "rows_rehired": u.rows_rehired,
+                "rows_inactive": u.rows_inactive,
+                "employee_sheets": u.employee_sheets,
+                "separation_sheets": u.separation_sheets,
+                "invoice_sheets": u.invoice_sheets,
+                "remarks": u.remarks
+            }
+            for u in uploads
+        ]
+    }
 
 
 
@@ -1002,7 +1416,7 @@ def get_logs(
 # ---------------------------------------------------------------------------
 
 @router.get("/settings")
-def get_settings():
+def get_settings(admin: str = Depends(get_offline_user)):
     """Return persisted policy thresholds or system defaults."""
     if os.path.exists(SETTINGS_FILE):
         try:
@@ -1014,7 +1428,7 @@ def get_settings():
 
 
 @router.post("/settings")
-def save_settings(payload: SettingsPayload):
+def save_settings(payload: SettingsPayload, admin: str = Depends(get_offline_user)):
     """Persist validated policy thresholds to a local JSON file."""
     try:
         with open(SETTINGS_FILE, "w", encoding="utf-8") as fh:

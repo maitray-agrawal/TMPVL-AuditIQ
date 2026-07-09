@@ -1792,3 +1792,220 @@ class ReportService:
         
         return output.getvalue()
 
+    @classmethod
+    def generate_invoice_history_report(cls, db: Session) -> bytes:
+        from backend.app.models.models import Invoice
+        invoices = db.query(Invoice).order_by(Invoice.uploaded_at.desc()).all()
+        headers = [
+            "Invoice ID", "Invoice Number", "Invoice Date", "Billing Month", "Billing Year",
+            "Vendor Name", "Workbook Name", "Sheet Name", "Status", "Billed Amount",
+            "Approved Amount", "Rejected Amount", "Fraud Amount", "Uploaded By", "Uploaded At"
+        ]
+        rows = [
+            [
+                inv.invoice_id, inv.invoice_number, inv.invoice_date.strftime("%Y-%m-%d") if inv.invoice_date else "",
+                inv.billing_month, inv.billing_year, inv.vendor_name, inv.workbook_name, inv.sheet_name,
+                inv.status, inv.total_amount, inv.approved_amount, inv.rejected_amount, inv.fraud_amount,
+                inv.uploaded_by, inv.uploaded_at.strftime("%Y-%m-%d %H:%M:%S") if inv.uploaded_at else ""
+            ]
+            for inv in invoices
+        ]
+        return cls._create_workbook_bytes("Invoice History", headers, rows)
+
+    @classmethod
+    def generate_monthly_billing_summary_report(cls, db: Session) -> bytes:
+        from backend.app.models.models import Invoice
+        summary = db.query(
+            Invoice.billing_month,
+            Invoice.billing_year,
+            func.sum(Invoice.total_amount).label("total_billed"),
+            func.sum(Invoice.approved_amount).label("total_approved"),
+            func.sum(Invoice.rejected_amount).label("total_rejected"),
+            func.sum(Invoice.fraud_amount).label("total_fraud"),
+            func.count(Invoice.invoice_id).label("invoice_count")
+        ).group_by(Invoice.billing_month, Invoice.billing_year).order_by(Invoice.billing_year.desc(), Invoice.billing_month.desc()).all()
+        
+        headers = [
+            "Billing Month", "Billing Year", "Billed Amount (₹)", "Approved Amount (₹)",
+            "Rejected Amount (₹)", "Fraud Amount (₹)", "Invoice Count"
+        ]
+        rows = [
+            [
+                s.billing_month, s.billing_year, s.total_billed or 0.0, s.total_approved or 0.0,
+                s.total_rejected or 0.0, s.total_fraud or 0.0, s.invoice_count or 0
+            ]
+            for s in summary
+        ]
+        return cls._create_workbook_bytes("Monthly Billing Summary", headers, rows)
+
+    @classmethod
+    def generate_duplicate_billing_report(cls, db: Session) -> bytes:
+        from backend.app.models.models import InvoiceItem, ValidationResult
+        duplicates = db.query(InvoiceItem).join(
+            ValidationResult, InvoiceItem.id == ValidationResult.invoice_record_id
+        ).filter(
+            ValidationResult.reason_code.in_(["REPEATED_MONTHLY_BILLING", "DUP_DISTRIBUTION_DATE", "DUP_KIT_CLAIM", "DUPLICATE_BILLING", "DUPLICATE_TICKET", "DUPLICATE_AADHAAR"])
+        ).all()
+        
+        headers = [
+            "Trainee ID", "Candidate Name", "Invoice Number", "Invoice Date", "Garments claimed",
+            "Billed Amount (₹)", "Approved Amount (₹)", "Violation Type", "Details"
+        ]
+        rows = []
+        for item in duplicates:
+            flags = db.query(ValidationResult).filter(
+                ValidationResult.invoice_record_id == item.id,
+                ValidationResult.reason_code.in_(["REPEATED_MONTHLY_BILLING", "DUP_DISTRIBUTION_DATE", "DUP_KIT_CLAIM", "DUPLICATE_BILLING", "DUPLICATE_TICKET", "DUPLICATE_AADHAAR"])
+            ).all()
+            for flag in flags:
+                rows.append([
+                    item.trainee_id, item.candidate_name, item.invoice_number, 
+                    item.invoice_date.strftime("%Y-%m-%d") if item.invoice_date else "",
+                    f"Jeans: {item.jeans_count}, Shirts: {item.shirt_count}",
+                    item.claimed_amount, item.approved_amount, flag.rule_name, flag.message
+                ])
+                
+        return cls._create_workbook_bytes("Duplicate Billing", headers, rows)
+
+    @classmethod
+    def generate_repeated_payment_report(cls, db: Session) -> bytes:
+        from backend.app.models.models import PaymentLedger, Trainee
+        subq = db.query(
+            PaymentLedger.trainee_id,
+            PaymentLedger.payment_type
+        ).group_by(
+            PaymentLedger.trainee_id, PaymentLedger.payment_type
+        ).having(func.count(PaymentLedger.id) > 1).subquery()
+        
+        repeated = db.query(PaymentLedger).join(
+            subq, (PaymentLedger.trainee_id == subq.c.trainee_id) & (PaymentLedger.payment_type == subq.c.payment_type)
+        ).join(
+            Trainee, PaymentLedger.trainee_id == Trainee.id
+        ).order_by(PaymentLedger.trainee_id, PaymentLedger.payment_type).all()
+        
+        headers = [
+            "Trainee ID", "Trainee Name", "Invoice Number", "Payment Type", 
+            "Amount Paid (₹)", "Payment Date", "Master Status"
+        ]
+        rows = [
+            [
+                r.trainee_id, r.trainee.name if r.trainee else "", r.invoice_number,
+                r.payment_type, r.amount_paid, r.payment_date.strftime("%Y-%m-%d") if r.payment_date else "",
+                r.trainee.status if r.trainee else ""
+            ]
+            for r in repeated
+        ]
+        return cls._create_workbook_bytes("Repeated Payments", headers, rows)
+
+    @classmethod
+    def generate_outstanding_payment_report(cls, db: Session) -> bytes:
+        from backend.app.models.models import InvoiceItem
+        items = db.query(InvoiceItem).filter(InvoiceItem.approved_amount < InvoiceItem.claimed_amount).all()
+        
+        headers = [
+            "Trainee ID", "Candidate Name", "Invoice Number", "Invoice Date", 
+            "Billed Amount (₹)", "Approved Amount (₹)", "Outstanding Amount (₹)", "Status", "Reason"
+        ]
+        rows = [
+            [
+                item.trainee_id, item.candidate_name, item.invoice_number,
+                item.invoice_date.strftime("%Y-%m-%d") if item.invoice_date else "",
+                item.claimed_amount, item.approved_amount, max(0.0, item.claimed_amount - item.approved_amount),
+                item._status, item.reason
+            ]
+            for item in items
+        ]
+        return cls._create_workbook_bytes("Outstanding Payments", headers, rows)
+
+    @classmethod
+    def generate_invoice_comparison_report(cls, db: Session, invoice_a: str, invoice_b: str) -> bytes:
+        from backend.app.models.models import InvoiceItem
+        
+        items_a = db.query(InvoiceItem).filter(InvoiceItem.invoice_number == invoice_a).all()
+        items_b = db.query(InvoiceItem).filter(InvoiceItem.invoice_number == invoice_b).all()
+        
+        map_a = {item.trainee_id or item.ticket_number: item for item in items_a}
+        map_b = {item.trainee_id or item.ticket_number: item for item in items_b}
+        
+        headers = [
+            "Trainee/Ticket ID", "Candidate Name", "Status in A", "Status in B", 
+            "Billed Total in A (₹)", "Billed Total in B (₹)", "Difference (₹)", "Comparison Remarks"
+        ]
+        rows = []
+        
+        all_keys = set(map_a.keys()).union(set(map_b.keys()))
+        for key in all_keys:
+            item_a = map_a.get(key)
+            item_b = map_b.get(key)
+            
+            name = (item_b.candidate_name if item_b else item_a.candidate_name) if (item_b or item_a) else ""
+            status_a = item_a._status if item_a else "Absent"
+            status_b = item_b._status if item_b else "Absent"
+            billed_a = item_a.claimed_amount if item_a else 0.0
+            billed_b = item_b.claimed_amount if item_b else 0.0
+            diff = billed_b - billed_a
+            
+            if item_a and not item_b:
+                remarks = f"Removed in {invoice_b}"
+            elif not item_a and item_b:
+                remarks = f"Added in {invoice_b}"
+            elif abs(diff) > 0.01:
+                remarks = f"Billed amount changed by ₹{diff:,.2f}"
+            else:
+                remarks = "No change"
+                
+            rows.append([
+                key, name, status_a, status_b, billed_a, billed_b, diff, remarks
+            ])
+            
+        return cls._create_workbook_bytes("Invoice Comparison", headers, rows)
+
+    @classmethod
+    def generate_vendor_summary_report(cls, db: Session) -> bytes:
+        from backend.app.models.models import Invoice
+        summary = db.query(
+            Invoice.vendor_name,
+            func.count(Invoice.invoice_id).label("total_invoices"),
+            func.sum(Invoice.total_amount).label("total_billed"),
+            func.sum(Invoice.approved_amount).label("total_approved"),
+            func.sum(Invoice.rejected_amount).label("total_rejected"),
+            func.sum(Invoice.fraud_amount).label("total_fraud")
+        ).group_by(Invoice.vendor_name).all()
+        
+        headers = [
+            "Vendor Name", "Total Invoices", "Total Billed (₹)", 
+            "Total Approved (₹)", "Total Rejected (₹)", "Total Fraud (₹)"
+        ]
+        rows = [
+            [
+                s.vendor_name or "Unknown Vendor", s.total_invoices or 0, s.total_billed or 0.0,
+                s.total_approved or 0.0, s.total_rejected or 0.0, s.total_fraud or 0.0
+            ]
+            for s in summary
+        ]
+        return cls._create_workbook_bytes("Vendor Summary", headers, rows)
+
+    @classmethod
+    def generate_employee_billing_history_report(cls, db: Session) -> bytes:
+        from backend.app.models.models import InvoiceItem, Trainee
+        items = db.query(InvoiceItem).join(Trainee, InvoiceItem.trainee_id == Trainee.id).order_by(Trainee.id, InvoiceItem.invoice_date).all()
+        
+        headers = [
+            "Trainee ID", "Trainee Name", "DOJ", "Master Status", 
+            "Invoice Number", "Invoice Date", "Billed Amount (₹)", "Approved Amount (₹)", 
+            "Rejected Amount (₹)", "Garments", "Status", "Reason"
+        ]
+        rows = [
+            [
+                item.trainee_id, item.trainee.name if item.trainee else "", 
+                item.trainee.doj.strftime("%Y-%m-%d") if item.trainee and item.trainee.doj else "",
+                item.trainee.status if item.trainee else "",
+                item.invoice_number, item.invoice_date.strftime("%Y-%m-%d") if item.invoice_date else "",
+                item.claimed_amount, item.approved_amount, item.rejected_amount,
+                f"Jeans: {item.jeans_count}, Shirts: {item.shirt_count}",
+                item._status, item.reason
+            ]
+            for item in items
+        ]
+        return cls._create_workbook_bytes("Employee Billing History", headers, rows)
+

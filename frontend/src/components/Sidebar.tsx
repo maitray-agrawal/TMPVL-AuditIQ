@@ -11,7 +11,8 @@ import {
   Download, 
   History, 
   Settings as SettingsIcon,
-  ShieldCheck
+  ShieldCheck,
+  ClipboardList
 } from 'lucide-react';
 import { 
   Box, 
@@ -23,6 +24,7 @@ import {
   Typography, 
   Divider 
 } from '@mui/material';
+
 
 interface SidebarProps {
   currentPage: string;
@@ -36,6 +38,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentPage, onPageChange }) =
     { id: 'upload_bdc', label: 'BDC Upload', icon: <FileUp size={20} /> },
     { id: 'upload_separation', label: 'Separation Upload', icon: <UserMinus size={20} /> },
     { id: 'upload_invoice', label: 'Invoice Upload', icon: <Receipt size={20} /> },
+    { id: 'upload_history', label: 'Upload History', icon: <ClipboardList size={20} /> },
     { id: 'validation', label: 'Validation Engine', icon: <CheckSquare size={20} /> },
     { id: 'reconciliation', label: 'Reconciliation', icon: <BarChart3 size={20} /> },
     { id: 'ledger', label: 'Payment Ledger', icon: <BookOpen size={20} /> },
@@ -43,6 +46,8 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentPage, onPageChange }) =
     { id: 'logs', label: 'Audit Logs', icon: <History size={20} /> },
     { id: 'settings', label: 'Settings', icon: <SettingsIcon size={20} /> },
   ];
+
+
 
   return (
     <Box
@@ -134,13 +139,15 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentPage, onPageChange }) =
               </ListItem>
             );
           })}
+          
+
         </List>
       </Box>
 
       {/* Footer Branding */}
       <Box sx={{ p: 2, borderTop: '1px solid rgba(255, 255, 255, 0.08)', textAlign: 'center' }}>
         <Typography variant="caption" sx={{ color: 'text.secondary', fontSize: '0.75rem' }}>
-          v1.0.0 • Offline Production
+          v2.0.0 • Offline Production
         </Typography>
       </Box>
     </Box>

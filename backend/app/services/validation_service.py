@@ -25,7 +25,11 @@ from backend.app.services.rules import (
     RuleKitLimit,
     RuleSeparationChecks,
     RuleMultipleSubmissions,
-    RuleAmountMismatch
+    RuleAmountMismatch,
+    RuleInactiveEmployee,
+    RuleMetadataMismatch,
+    RuleChronology,
+    RuleCrossInvoice
 )
 
 # For backward compatibility with existing tests that import these classes from validation_service
@@ -161,6 +165,18 @@ class ValidationService:
             ).all()
             db_aadhaars = {aadhaar: t_id for t_id, aadhaar in res_aadhaars}
 
+        # Fetch historical items for the trainees in a single query
+        historical_items_map = {}
+        if trainee_ids:
+            from backend.app.models.models import Invoice, InvoiceItem
+            hist_items = db.query(InvoiceItem).join(Invoice).filter(
+                InvoiceItem.trainee_id.in_(trainee_ids),
+                Invoice.invoice_number != invoice_number,
+                Invoice.status == "ACTIVE"
+            ).all()
+            for item in hist_items:
+                historical_items_map.setdefault(item.trainee_id, []).append(item)
+
         invoice_history_map = {}
         if trainee_ids:
             other_invoices = db.query(InvoiceRecord.trainee_id, InvoiceRecord.invoice_number, InvoiceRecord.invoice_date).filter(
@@ -181,6 +197,7 @@ class ValidationService:
         rules = [
             RuleTraineeNotFound(),
             RuleBlockedEmployee(),
+            RuleInactiveEmployee(),
             RuleAmountMismatch(),
             RuleDuplicateBilling(),
             RuleDuplicateTicket(),
@@ -191,7 +208,10 @@ class ValidationService:
             Rule180Days(),
             RuleJoiningLimit(),
             RuleAnnualLimit(),
-            RuleKitLimit()
+            RuleKitLimit(),
+            RuleMetadataMismatch(),
+            RuleChronology(),
+            RuleCrossInvoice()
         ]
 
         for record in records:
@@ -214,6 +234,7 @@ class ValidationService:
                 "db_tickets": db_tickets,
                 "db_aadhaars": db_aadhaars,
                 "invoice_history_map": invoice_history_map,
+                "historical_items_map": historical_items_map,
                 "record_results": [],
                 "block_trainee_reason": None
             }
@@ -280,22 +301,78 @@ class ValidationService:
             if state["block_trainee_reason"] and trainee_id:
                 TraineeRepository.block_trainee(db, trainee_id, state["block_trainee_reason"], commit=False)
 
+            # Calculate Fraud Score (0-100)
+            fraud_score = 0.0
+            critical_rules = ["RuleTraineeNotFound", "RuleBlockedEmployee", "RuleSeparationChecks", "RuleInactiveEmployee", "Inactive Employee Billing", "Distribution Date Before DOJ", "Future Distribution Date", "Repeated Monthly Billing", "Duplicate Distribution Date", "Duplicate Kit Claim"]
+            high_rules = ["RuleAnnualLimit", "RuleJoiningLimit", "Rule180Days"]
+            medium_rules = ["RuleAmountMismatch", "Name Mismatch"]
+            low_rules = ["RuleDuplicateBilling", "RuleDuplicateTicket", "RuleDuplicateAadhaar", "RuleMultipleSubmissions", "Rule30Days", "RuleKitLimit", "Batch Mismatch", "Joining Date Mismatch"]
+
+            for fail in state["record_results"]:
+                r_name = fail["rule_name"]
+                status = fail["status"]
+                
+                if status == "FRAUD":
+                    fraud_score += 40
+                elif status == "ERROR":
+                    fraud_score += 25
+                elif status == "WARNING":
+                    fraud_score += 10
+                    
+                if any(cr in r_name for cr in critical_rules):
+                    fraud_score += 40
+                elif any(hr in r_name for hr in high_rules):
+                    fraud_score += 25
+                elif any(mr in r_name for mr in medium_rules):
+                    fraud_score += 15
+                elif any(lr in r_name for lr in low_rules):
+                    fraud_score += 5
+            
+            fraud_score = min(100.0, fraud_score)
+            
+            if fraud_score <= 20:
+                fraud_cat = "Low"
+            elif fraud_score <= 50:
+                fraud_cat = "Medium"
+            elif fraud_score <= 80:
+                fraud_cat = "High"
+            else:
+                fraud_cat = "Critical"
+
+            record.fraud_score = fraud_score
+            record.fraud_category = fraud_cat
+            record.validation_summary = state["record_results"]
+            record.reason = "; ".join(f["message"] for f in state["record_results"]) if state["record_results"] else None
+
             # Determine aggregate status for this record based on flags
-            record_status = "VALIDATED"
+            record_status = "APPROVED"
             has_fraud = any(f.status == "FRAUD" for f in record_flags)
             has_error = any(f.status == "ERROR" for f in record_flags)
             has_warning = any(f.status == "WARNING" for f in record_flags)
 
             if has_fraud:
-                record_status = "EXCEPTION"
+                record_status = "FRAUD"
                 fraud_count += 1
             elif has_error:
-                record_status = "EXCEPTION"
+                record_status = "REJECTED"
                 error_count += 1
             elif has_warning:
-                record_status = "VALIDATED"
+                total_billed = record.billed_total_amount
+                total_approved = app_joining + app_180
+                if total_approved == 0:
+                    record_status = "REJECTED"
+                elif total_approved < total_billed:
+                    record_status = "PARTIALLY_APPROVED"
+                else:
+                    record_status = "APPROVED"
                 warning_count += 1
             else:
+                total_billed = record.billed_total_amount
+                total_approved = app_joining + app_180
+                if total_approved == 0:
+                    record_status = "REJECTED"
+                else:
+                    record_status = "APPROVED"
                 success_count += 1
 
             # Update approved amounts and status in db (commit=False for batching)
@@ -309,6 +386,24 @@ class ValidationService:
             )
 
         # Bulk commit all validation updates and results
+        db.commit()
+
+        # Update parent Invoice aggregates
+        from backend.app.models.models import Invoice, InvoiceItem
+        parent_invoices = db.query(Invoice).filter(
+            Invoice.invoice_number == invoice_number,
+            Invoice.status == "ACTIVE"
+        ).all()
+        for parent_inv in parent_invoices:
+            items = db.query(InvoiceItem).filter(InvoiceItem.invoice_id == parent_inv.invoice_id).all()
+            total_app = sum(item.approved_amount for item in items)
+            total_rej = sum(item.rejected_amount for item in items)
+            total_fraud = sum(item.claimed_amount for item in items if item._status == "FRAUD")
+            
+            parent_inv.approved_amount = total_app
+            parent_inv.rejected_amount = total_rej
+            parent_inv.fraud_amount = total_fraud
+            
         db.commit()
 
         total_duration = time.time() - start_time
