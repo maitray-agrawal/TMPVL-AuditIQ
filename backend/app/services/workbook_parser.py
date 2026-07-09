@@ -21,11 +21,12 @@ class WorkbookParser:
         ],
         "joining_date": [
             "begdaddmmyyyym", "begda", "joiningdate", "doj", "startdate", 
-            "dateofjoining", "joining"
+            "dateofjoining", "joining", "joining_date"
         ],
         "end_date": [
             "enddaddmmyyyym", "leavingdate", "enddate", "dol", "dateofleaving", 
-            "resignationdate", "separationdate"
+            "resignationdate", "separationdate", "seperationdate", "seperatedate", 
+            "separatedate", "lastworkingdate", "lwd", "end_date"
         ],
         "candidate_name": [
             "completename", "employeename", "candidatename", "name", 
@@ -45,7 +46,7 @@ class WorkbookParser:
         "email": ["email", "emailid", "emailaddress", "mail", "mailid"],
         "category": [
             "category", "traineecategory", "empcategory", "employeecategory", 
-            "scheme", "program", "course", "type"
+            "scheme", "program", "course", "type", "schemetype"
         ],
         "batch": ["batch", "group", "batchname", "year", "joiningbatch"],
         "shop": [
@@ -70,8 +71,46 @@ class WorkbookParser:
         'claimedamount', 'billedtotal', 'totalamount', 'shirtquantity',
         'shirtqty', 'jeanquanity', 'jeanqty', 'jeansquantity', 'jeansqty',
         'amount', 'billamount', 'billingamount', 'pair', 'uniformpair', 'kitpair',
-        'distributiondate', 'issueddate', 'pageno', 'page'
+        'distributiondate', 'issueddate', 'pageno', 'page', 'invoicenumber',
+        'invoiceno', 'invoice_number', 'invoice_no', 'invoice'
     ]
+
+    @classmethod
+    def _has_synonym(cls, row_cleaned: List[Any], synonym_key: str) -> bool:
+        """Robust check if any cell in row matches a synonym key, supporting exact and substring matches."""
+        headers = [cls.normalize_header(c) for c in row_cleaned if c is not None]
+        keywords = [cls.normalize_header(kw) for kw in cls.SYNONYMS.get(synonym_key, [])]
+        
+        # Check exact matches first
+        for h in headers:
+            if not h:
+                continue
+            if h in keywords:
+                return True
+                
+        # Check substring matches next
+        for h in headers:
+            if not h:
+                continue
+            for kw in keywords:
+                if kw and (kw in h or h in kw):
+                    if kw == "name" and any(p in h for p in ("first", "middle", "last")):
+                        continue
+                    return True
+        return False
+
+    @classmethod
+    def _has_invoice_marker(cls, row_cleaned: List[Any]) -> bool:
+        """Robust check if any cell in row matches invoice keywords, supporting exact and substring matches."""
+        headers = [cls.normalize_header(c) for c in row_cleaned if c is not None]
+        keywords = [cls.normalize_header(kw) for kw in cls.INVOICE_KWS]
+        for h in headers:
+            if not h:
+                continue
+            for kw in keywords:
+                if kw and (kw in h or h in kw):
+                    return True
+        return False
 
     @staticmethod
     def normalize_header(header: str) -> str:
@@ -192,6 +231,7 @@ class WorkbookParser:
         best_sheet_type = "Unknown"
         best_confidence = 0.22
         best_headers = []
+        best_reason = "No known schema matches."
         
         for idx, row in enumerate(rows_sample):
             if not row or all(c is None or str(c).strip() == "" for c in row):
@@ -203,21 +243,16 @@ class WorkbookParser:
             if len(non_empty_cells) < 2:
                 continue
                 
-            # Count synonym matches
-            has_id = any(cls.normalize_header(c) in cls.SYNONYMS["trainee_id"] for c in row_cleaned if c)
-            has_ticket = any(cls.normalize_header(c) in cls.SYNONYMS["ticket_number"] for c in row_cleaned if c)
-            has_joining = any(cls.normalize_header(c) in cls.SYNONYMS["joining_date"] for c in row_cleaned if c)
-            has_end_date = any(cls.normalize_header(c) in cls.SYNONYMS["end_date"] for c in row_cleaned if c)
-            has_name = any(
-                cls.normalize_header(c) in cls.SYNONYMS["candidate_name"] or 
-                cls.normalize_header(c) in cls.SYNONYMS["first_name"] 
-                for c in row_cleaned if c
-            )
-            has_reason = any(cls.normalize_header(c) in cls.SYNONYMS["reason"] for c in row_cleaned if c)
-            has_invoice_marker = any(
-                cls.normalize_header(c) in cls.INVOICE_KWS
-                for c in row_cleaned if c
-            )
+            # Count synonym matches using the robust helpers
+            has_id = cls._has_synonym(row_cleaned, "trainee_id")
+            has_ticket = cls._has_synonym(row_cleaned, "ticket_number")
+            has_joining = cls._has_synonym(row_cleaned, "joining_date")
+            has_end_date = cls._has_synonym(row_cleaned, "end_date")
+            has_name = cls._has_synonym(row_cleaned, "candidate_name") or cls._has_synonym(row_cleaned, "first_name")
+            has_reason = cls._has_synonym(row_cleaned, "reason")
+            has_batch = cls._has_synonym(row_cleaned, "batch")
+            has_category = cls._has_synonym(row_cleaned, "category")
+            has_invoice_marker = cls._has_invoice_marker(row_cleaned)
             has_total = any(cls.normalize_header(c) == "total" for c in row_cleaned if c)
             
             # Text cells count (non-numeric)
@@ -230,42 +265,137 @@ class WorkbookParser:
                     except ValueError:
                         text_cells += 1
                         
-            # Scoring
-            score = 0.0
+            # Determine scores based on weights
+            em_score = 0.0
+            sep_score = 0.0
+            inv_score = 0.0
+            
+            # Employee Master score details
+            em_reasons = []
             if has_id or has_ticket:
-                score += 10.0
+                em_score += 10.0
+                em_reasons.append("Ticket Number" if has_ticket else "Trainee ID")
             if has_joining:
-                score += 5.0
-            if has_end_date:
-                score += 5.0
+                em_score += 10.0
+                em_reasons.append("Joining Date")
             if has_name:
-                score += 5.0
+                em_score += 8.0
+                em_reasons.append("Candidate Name" if has_name else "Name")
+            if has_batch:
+                em_score += 4.0
+                em_reasons.append("Batch")
+            if has_category:
+                em_score += 4.0
+                em_reasons.append("Category")
+                
+            # Separation score details
+            sep_reasons = []
+            if has_id or has_ticket:
+                sep_score += 10.0
+                sep_reasons.append("Ticket Number" if has_ticket else "Trainee ID")
+            if has_end_date:
+                sep_score += 10.0
+                sep_reasons.append("Separation Date")
             if has_reason:
-                score += 5.0
-            if has_invoice_marker or has_total:
-                score += 5.0
-            score += text_cells * 0.5
+                sep_score += 8.0
+                sep_reasons.append("Separation Reason")
+                
+            # Invoice score details
+            inv_reasons = []
+            if has_id or has_ticket:
+                inv_score += 10.0
+                inv_reasons.append("Trainee/Ticket ID")
+            if has_invoice_marker:
+                inv_score += 25.0
+                inv_reasons.append("Invoice fields")
+            if has_total:
+                inv_score += 4.0
+                inv_reasons.append("Total fields")
+                
+            # Hard constraints:
+            # 0. A valid sheet must contain Trainee ID or Ticket Number to be classified as Employee Master, Separation, or Invoice.
+            if not (has_id or has_ticket):
+                em_score = 0.0
+                sep_score = 0.0
+                inv_score = 0.0
+                em_reasons = []
+                sep_reasons = []
+                inv_reasons = []
+
+            # 0.1 Employee Master sheets must contain Joining Date.
+            if not has_joining:
+                em_score = 0.0
+                em_reasons = []
+
+            # 1. Separation sheets should only be classified when Date of Leaving / DOL / Separation Date columns exist.
+            if not has_end_date:
+                sep_score = 0.0
+                sep_reasons = []
+                
+            # 2. Invoice sheets should only be classified when Pair, Amount, Distribution Date, Invoice Number, Uniform or similar invoice fields exist.
+            if not (has_invoice_marker or has_total):
+                inv_score = 0.0
+                inv_reasons = []
+                
+            # 3. Employee Master score must always override Separation when both partially match (meaning both scores > 0).
+            # We enforce this if joining_date column is present, which clearly marks it as master ingestion.
+            # If both partially match, and has_joining is present, EM overrides.
+            if em_score > 0 and sep_score > 0 and has_joining:
+                # Override: Employee Master wins
+                em_score += 50.0 # Large boost to ensure Employee Master wins
             
             # Determine classification for this row
             row_type = "Unknown"
             row_conf = 0.22
-            if (has_id or has_ticket) and has_end_date and has_reason:
-                row_type = "Separation"
-                row_conf = 0.99
-            elif (has_id or has_ticket) and has_joining and has_name:
-                row_type = "Employee Master"
-                row_conf = 0.98
-            elif (has_id or has_ticket) and (has_invoice_marker or has_total):
-                row_type = "Invoice"
-                row_conf = 0.95
+            row_score = 0.0
+            reason_str = "No known schema matches."
+            
+            if em_score > 0 or sep_score > 0 or inv_score > 0:
+                if em_score >= sep_score and em_score >= inv_score:
+                    row_type = "Employee Master"
+                    row_conf = 0.98 if has_joining else 0.85
+                    row_score = em_score
+                    reason_str = f"Found " + " + ".join(em_reasons) + f" (EM score: {em_score:.1f} vs Sep: {sep_score:.1f})"
+                elif sep_score >= em_score and sep_score >= inv_score:
+                    row_type = "Separation"
+                    row_conf = 0.99
+                    row_score = sep_score
+                    reason_str = f"Found " + " + ".join(sep_reasons) + f" (Sep score: {sep_score:.1f} vs EM: {em_score:.1f})"
+                else:
+                    row_type = "Invoice"
+                    row_conf = 0.95
+                    row_score = inv_score
+                    reason_str = f"Found " + " + ".join(inv_reasons) + f" (Invoice score: {inv_score:.1f})"
+            else:
+                row_score = text_cells * 0.5
                 
-            if score > best_score:
-                best_score = score
+            # We want to find the header row that maximizes the classification score or general text score
+            final_row_score = max(em_score, sep_score, inv_score) if (em_score > 0 or sep_score > 0 or inv_score > 0) else row_score
+            
+            if final_row_score > best_score:
+                best_score = final_row_score
                 best_idx = idx
                 best_sheet_type = row_type
                 best_confidence = row_conf
                 best_headers = [str(c).strip() if c is not None else "" for c in row]
+                best_reason = reason_str
                 
+        # Log the classification reason
+        import logging
+        logger = logging.getLogger("workbook_parser")
+        sheet_name_str = ws.title
+        logger.info(f"Sheet Classification: Workbook Sheet '{sheet_name_str}' -> Classification: '{best_sheet_type}', Reason: {best_reason}")
+        print(f"Sheet Classification: Workbook Sheet '{sheet_name_str}' -> Classification: '{best_sheet_type}', Reason: {best_reason}")
+        
+        # Attach the classification reason to the class so import_service can fetch it for detailed logs
+        if not hasattr(cls, "_CLASSIFICATION_REASONS"):
+            cls._CLASSIFICATION_REASONS = {}
+        cls._CLASSIFICATION_REASONS[sheet_name_str] = {
+            "type": best_sheet_type,
+            "score_summary": best_reason,
+            "headers": best_headers
+        }
+
         if best_idx is not None and best_score > 0.0:
             return best_sheet_type, best_confidence, best_idx, best_headers
             
@@ -284,9 +414,14 @@ class WorkbookParser:
                     except ValueError:
                         text_cells_count += 1
             if text_cells_count >= 2:
+                # Fallback logging
+                logger.info(f"Sheet Classification Fallback: Workbook Sheet '{ws.title}' -> Classification: 'Unknown', Reason: No matching synonym schema, matched on text cells.")
+                print(f"Sheet Classification Fallback: Workbook Sheet '{ws.title}' -> Classification: 'Unknown', Reason: No matching synonym schema, matched on text cells.")
                 return "Unknown", 0.22, idx, original_headers
                 
+        logger.info(f"Sheet Classification Fallback: Workbook Sheet '{ws.title}' -> Classification: 'Unknown', Reason: No headers found.")
         return "Unknown", 0.22, None, []
+
 
     @classmethod
     def get_merged_cells_map(cls, ws) -> Dict[Tuple[int, int], Any]:

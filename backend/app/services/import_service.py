@@ -597,7 +597,7 @@ class ImportService:
                     sheet_failed += 1
                     state["errors"].append(f"Sheet '{sheet_name}', Row {row_num}: Database operation failed: {str(e)}")
 
-            db.commit()
+            db.flush()
 
         # Run process_batch in batches
         for i in range(0, len(sheet["rows"]), BATCH_SIZE):
@@ -621,8 +621,34 @@ class ImportService:
             errors=sheet_failed,
             before_state={"trainees": sheet_before_state} if sheet_before_state else None,
             after_state={"trainees": sheet_after_state} if sheet_after_state else None,
-            upload_id=state.get("upload_id")
+            upload_id=state.get("upload_id"),
+            commit=False
         )
+
+        # Detailed parser debug log
+        import logging
+        logger = logging.getLogger("workbook_parser")
+        class_info = WorkbookParser._CLASSIFICATION_REASONS.get(sheet_name, {})
+        classification_score = class_info.get("score_summary", "N/A")
+        sheet_type = sheet.get("sheet_type", "Employee Master")
+        
+        debug_msg = (
+            f"\n=== DETAILED PARSER DEBUG LOG ===\n"
+            f"Workbook Name       : {file_name}\n"
+            f"Sheet Name          : {sheet_name}\n"
+            f"Detected Headers    : {sheet.get('original_headers', [])}\n"
+            f"Classification Score: {classification_score}\n"
+            f"Final Sheet Type    : {sheet_type}\n"
+            f"Processing Route    : Employee Master Ingestion\n"
+            f"Rows Imported       : {sheet_inserted}\n"
+            f"Rows Updated        : {sheet_updated}\n"
+            f"Rows Failed         : {sheet_failed}\n"
+            f"Warnings            : {state.get('warnings', [])}\n"
+            f"Errors              : {state.get('errors', [])}\n"
+            f"================================="
+        )
+        logger.info(debug_msg)
+        print(debug_msg)
 
     @classmethod
     def _process_separation_sheet(cls, db: Session, sheet: Dict[str, Any], file_name: str, BATCH_SIZE: int, state: Dict[str, Any]) -> None:
@@ -867,7 +893,7 @@ class ImportService:
                     sheet_failed += 1
                     state["errors"].append(f"Sheet '{sheet_name}', Row {row_num}: Database operation failed: {str(e)}")
 
-            db.commit()
+            db.flush()
 
         # Run process_batch in batches
         for i in range(0, len(sheet["rows"]), BATCH_SIZE):
@@ -891,8 +917,34 @@ class ImportService:
             errors=sheet_failed,
             before_state={"trainees": sheet_before_state} if sheet_before_state else None,
             after_state={"trainees": sheet_after_state} if sheet_after_state else None,
-            upload_id=state.get("upload_id")
+            upload_id=state.get("upload_id"),
+            commit=False
         )
+
+        # Detailed parser debug log
+        import logging
+        logger = logging.getLogger("workbook_parser")
+        class_info = WorkbookParser._CLASSIFICATION_REASONS.get(sheet_name, {})
+        classification_score = class_info.get("score_summary", "N/A")
+        sheet_type = sheet.get("sheet_type", "Separation")
+        
+        debug_msg = (
+            f"\n=== DETAILED PARSER DEBUG LOG ===\n"
+            f"Workbook Name       : {file_name}\n"
+            f"Sheet Name          : {sheet_name}\n"
+            f"Detected Headers    : {sheet.get('original_headers', [])}\n"
+            f"Classification Score: {classification_score}\n"
+            f"Final Sheet Type    : {sheet_type}\n"
+            f"Processing Route    : Separation Ingestion\n"
+            f"Rows Imported       : 0\n"
+            f"Rows Updated        : {sheet_separated + sheet_blocked}\n"
+            f"Rows Failed         : {sheet_failed}\n"
+            f"Warnings            : {state.get('warnings', [])}\n"
+            f"Errors              : {state.get('errors', [])}\n"
+            f"================================="
+        )
+        logger.info(debug_msg)
+        print(debug_msg)
 
     @classmethod
     def import_bdc_workbook(cls, db: Session, file_content: bytes, file_name: str, upload_mode: str = "INCREMENTAL", operator: str = "Admin") -> Dict[str, Any]:
@@ -916,6 +968,22 @@ class ImportService:
             is_duplicate = True
             duplicate_warning = f"Workbook '{file_name}' was already uploaded previously (Upload ID: {existing_upload.upload_id})."
             
+        # Create UploadHistory first and flush it to the session
+        upload = UploadHistory(
+            upload_id=current_upload_id,
+            file_name=file_name,
+            file_hash=file_hash,
+            file_size=file_size,
+            upload_type="UNKNOWN",
+            uploaded_by=operator,
+            processing_time=0.0,
+            status="PROCESSING",
+            is_duplicate=is_duplicate,
+            remarks=duplicate_warning
+        )
+        db.add(upload)
+        db.flush()
+
         parsed_wb = WorkbookParser.parse_workbook(file_content, file_name)
         wb_stats = parsed_wb["stats"]
         
@@ -994,9 +1062,10 @@ class ImportService:
                         employee_id=mt.id,
                         before_state=before_state,
                         after_state=cls._serialize_trainee_state(mt),
-                        upload_id=current_upload_id
+                        upload_id=current_upload_id,
+                        commit=False
                     )
-                db.commit()
+                db.flush()
             else:
                 state["warnings"].append("Full Sync mode requested, but Employee Master sheets were empty or workbook processing encountered errors. Deactivations skipped.")
 
@@ -1019,25 +1088,28 @@ class ImportService:
         if failed_sheets:
             upload_status = "PARTIAL" if sheets_processed else "FAILED"
             
-        # Log upload history record
-        cls._save_upload_history(
-            db=db,
-            upload_id=current_upload_id,
-            file_name=file_name,
-            file_hash=file_hash,
-            file_size=file_size,
-            upload_type=upload_type,
-            uploaded_by=operator,
-            processing_time=total_duration,
-            status=upload_status,
-            is_duplicate=is_duplicate,
-            stats=wb_stats,
-            state=state,
-            employee_sheets=employee_sheets,
-            separation_sheets=separation_sheets,
-            invoice_sheets=[],
-            remarks=duplicate_warning
-        )
+        # Update existing UploadHistory summary fields in database
+        upload.upload_type = upload_type
+        upload.processing_time = total_duration
+        upload.status = upload_status
+        upload.workbook_version = wb_stats.get("workbook_version")
+        upload.parser_version = wb_stats.get("parser_version", "2.0.0")
+        upload.sheet_count = wb_stats.get("number_of_sheets", 0)
+        upload.visible_sheet_count = len(sheets_processed)
+        upload.hidden_sheet_count = len(skipped_sheets)
+        upload.rows_processed = state.get("rows_processed", 0)
+        upload.rows_inserted = state.get("created_count", 0)
+        upload.rows_updated = state.get("updated_count", 0)
+        upload.rows_no_change = state.get("rows_no_change", 0)
+        upload.rows_skipped = state.get("skip_count", 0)
+        upload.rows_failed = state.get("error_count", 0)
+        upload.rows_rehired = state.get("rows_rehired", 0)
+        upload.rows_inactive = state.get("rows_inactive", 0)
+        upload.employee_sheets = employee_sheets
+        upload.separation_sheets = separation_sheets
+        upload.invoice_sheets = []
+        upload.remarks = duplicate_warning
+        db.flush()
         
         AuditLogRepository.add_log(
             db=db,
@@ -1054,8 +1126,11 @@ class ImportService:
             failed=state["error_count"],
             warnings=len(state["warnings"]),
             errors=state["error_count"],
-            upload_id=current_upload_id
+            upload_id=current_upload_id,
+            commit=False
         )
+        
+        db.commit()
 
         return {
             "workbook_name": file_name,
@@ -1192,6 +1267,22 @@ class ImportService:
             is_duplicate = True
             duplicate_warning = f"Workbook '{file_name}' was already uploaded previously (Upload ID: {existing_upload.upload_id})."
             
+        # Create UploadHistory first and flush it
+        upload = UploadHistory(
+            upload_id=current_upload_id,
+            file_name=file_name,
+            file_hash=file_hash,
+            file_size=file_size,
+            upload_type="SEPARATION",
+            uploaded_by=operator,
+            processing_time=0.0,
+            status="PROCESSING",
+            is_duplicate=is_duplicate,
+            remarks=duplicate_warning
+        )
+        db.add(upload)
+        db.flush()
+
         parsed_wb = WorkbookParser.parse_workbook(file_content, file_name)
         wb_stats = parsed_wb["stats"]
         
@@ -1253,25 +1344,28 @@ class ImportService:
         if failed_sheets:
             upload_status = "PARTIAL" if sheets_processed else "FAILED"
             
-        # Log upload history record
-        cls._save_upload_history(
-            db=db,
-            upload_id=current_upload_id,
-            file_name=file_name,
-            file_hash=file_hash,
-            file_size=file_size,
-            upload_type="SEPARATION",
-            uploaded_by=operator,
-            processing_time=total_duration,
-            status=upload_status,
-            is_duplicate=is_duplicate,
-            stats=wb_stats,
-            state=state,
-            employee_sheets=[],
-            separation_sheets=separation_sheets,
-            invoice_sheets=[],
-            remarks=duplicate_warning
-        )
+        # Update existing UploadHistory summary fields in database
+        upload.upload_type = "SEPARATION"
+        upload.processing_time = total_duration
+        upload.status = upload_status
+        upload.workbook_version = wb_stats.get("workbook_version")
+        upload.parser_version = wb_stats.get("parser_version", "2.0.0")
+        upload.sheet_count = wb_stats.get("number_of_sheets", 0)
+        upload.visible_sheet_count = len(sheets_processed)
+        upload.hidden_sheet_count = len(skipped_sheets)
+        upload.rows_processed = state.get("rows_processed", 0)
+        upload.rows_inserted = 0
+        upload.rows_updated = state.get("separated_count", 0) + state.get("blocked_count", 0)
+        upload.rows_no_change = state.get("rows_no_change", 0)
+        upload.rows_skipped = state.get("skip_count", 0)
+        upload.rows_failed = state.get("error_count", 0)
+        upload.rows_rehired = 0
+        upload.rows_inactive = 0
+        upload.employee_sheets = []
+        upload.separation_sheets = separation_sheets
+        upload.invoice_sheets = []
+        upload.remarks = duplicate_warning
+        db.flush()
         
         AuditLogRepository.add_log(
             db=db,
@@ -1288,8 +1382,11 @@ class ImportService:
             failed=state["error_count"],
             warnings=len(state["warnings"]),
             errors=state["error_count"],
-            upload_id=current_upload_id
+            upload_id=current_upload_id,
+            commit=False
         )
+        
+        db.commit()
         
         return {
             "workbook_name": file_name,

@@ -2,10 +2,7 @@ import os
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-DATABASE_FILE = "tmpvl_audit.db"
-# Use absolute path to ensure database is created in backend/ directory
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, DATABASE_FILE)}"
+from backend.app.core.config import DATABASE_URL
 
 engine = create_engine(
     DATABASE_URL,

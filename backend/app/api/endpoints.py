@@ -49,8 +49,8 @@ def get_offline_user() -> str:
 # Helpers
 # ---------------------------------------------------------------------------
 
-_BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SETTINGS_FILE = os.path.join(_BASE_DIR, "settings_config.json")
+from backend.app.core.config import BASE_DIR
+SETTINGS_FILE = (BASE_DIR / "settings_config.json").as_posix()
 
 _EXCEL_EXTENSIONS = {".xlsx", ".xls"}
 _MAX_LOG_LIMIT = 500

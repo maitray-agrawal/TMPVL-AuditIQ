@@ -9,8 +9,10 @@ from backend.app.models.models import (
     InvoiceRecord,
     PaymentLedger,
     ValidationResult,
-    AuditLog
+    AuditLog,
+    UploadHistory
 )
+
 
 class TraineeRepository:
     @staticmethod
@@ -399,8 +401,15 @@ class AuditLogRepository:
         employee_id: Optional[str] = None,
         invoice_number: Optional[str] = None,
         timestamp: Optional[datetime.datetime] = None,
-        upload_id: Optional[str] = None
-    ) -> AuditLog:
+        upload_id: Optional[str] = None,
+        commit: bool = True
+    ) -> Optional[AuditLog]:
+        if upload_id is not None:
+            # Validate UploadHistory exists before inserting AuditLog
+            exists = db.query(UploadHistory).filter(UploadHistory.upload_id == upload_id).first()
+            if not exists:
+                return None
+
         log = AuditLog(
             action=action,
             module=module,
@@ -424,8 +433,11 @@ class AuditLogRepository:
         if timestamp:
             log.timestamp = timestamp
         db.add(log)
-        db.commit()
-        db.refresh(log)
+        if commit:
+            db.commit()
+            db.refresh(log)
+        else:
+            db.flush()
         return log
 
     @staticmethod

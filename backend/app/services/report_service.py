@@ -80,7 +80,7 @@ class ReportService:
             Trainee, InvoiceRecord.trainee_id == Trainee.id
         ).filter(
             InvoiceRecord.invoice_number == invoice_number,
-            InvoiceRecord.status == "APPROVED"
+            InvoiceRecord.status == "VALIDATED"
         ).all()
 
         rows = []

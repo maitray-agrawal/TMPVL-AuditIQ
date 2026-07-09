@@ -1,62 +1,67 @@
-cat > .gitignore << 'EOF'
-# =========================
-# Python
-# =========================
+# Python Virtual Environments
 .venv/
 venv/
+ENV/
+
+# Python caching & bytecode
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 .pytest_cache/
 .mypy_cache/
-.coverage
-htmlcov/
 
-# =========================
-# SQLite
-# =========================
+# Databases
 *.db
+*.sqlite3
 *.db-wal
 *.db-shm
-*.sqlite3
+test_db.sqlite
 
-# =========================
-# Logs
-# =========================
-*.log
-
-# =========================
-# Node
-# =========================
+# JavaScript/Node
 node_modules/
 frontend/node_modules/
 dist/
 frontend/dist/
+build/
 
-# =========================
-# Temporary / Scratch
-# =========================
-scratch/
-backend/scratch/
-tmp/
-temp/
-
-# =========================
-# IDE
-# =========================
+# IDE Configuration
 .vscode/
 .idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
 
-# =========================
-# Operating System
-# =========================
-.DS_Store
-Thumbs.db
+# Application generated files
+uploads/
+reports/
+templates/
+logs/
+temp/
+*.log
 
-# =========================
-# Environment Files
-# =========================
+# Test coverage
+.coverage
+htmlcov/
+coverage.xml
+.coverage.*
+
+# Scratch directory
+scratch/
+backend/scratch/
+
+# Environment configurations
 .env
 .env.*
-EOF
+!.env.example
+
+# OS Junk
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

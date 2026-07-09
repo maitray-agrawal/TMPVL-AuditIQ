@@ -1,193 +1,270 @@
-# TMPVL Billing Audit & Fraud Detection System
+# TMPVL AuditIQ — Billing Audit & Fraud Detection System
 
-![Python](https://img.shields.io/badge/Python-3.12+-blue?logo=python&)
-![React](https://img.shields.io/badge/React-19-blue?logo=react&)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-05998b?logo=fastapi)
-![MUI](https://img.shields.io/badge/MUI-v6-007FFF?logo=mui)
-![Vite](https://img.shields.io/badge/Vite-v5-646CFF?logo=vite)
-![Status](https://img.shields.io/badge/Status-Active-success)
+[![Python 3.12+](https://img.shields.io/badge/Python-3.12+-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![Node.js v20+](https://img.shields.io/badge/Node.js-v20+-green?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.111.0-05998b?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![React 19](https://img.shields.io/badge/React-19.0.0-blue?logo=react&logoColor=white)](https://react.dev/)
+[![Material UI v6](https://img.shields.io/badge/MUI-v6.0.0-007FFF?logo=mui&logoColor=white)](https://mui.com/)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Ubuntu%20%7C%20macOS-lightgrey)](#supported-platforms)
 
-A production-grade, completely offline enterprise application designed to audit and reconcile trainee billing submissions for **TMPVL**. The system automates the reconciliation process across three source workbooks (**BDC Master**, **Separations**, and **Vendor Invoices**), executing a comprehensive rule-based policy and fraud detection engine. It blocks double claims, enforces strict tenure and annual payment caps, validates kit quantities, and generates standardized financial ledger entries and audit reports.
-
----
-
-## ✨ Key Features
-
-*   **Automated Rule Engine**: Executes an 11-point policy to validate every line item, ensuring compliance with tenure, payment caps, and separation rules.
-*   **Fraud Detection**: Proactively identifies and flags high-risk activities like duplicate billing, billing for blocked trainees, and duplicate Aadhaar/Ticket numbers.
-*   **Data Ingestion & Sync**: Seamlessly imports and synchronizes data from BDC Master, Separation, and Vendor Invoice Excel workbooks.
-*   **Financial Ledger**: Maintains an immutable, append-only ledger of all approved payouts, tracking per-trainee lifetime spending against an annual cap.
-*   **Comprehensive Reporting**: Generates detailed Excel reports for approved/rejected invoices, financial summaries, exception lists, and fraud incidents.
-*   **Offline First**: Designed to run in fully air-gapped environments with no internet connectivity required.
-*   **Modern UI**: A responsive and intuitive web interface built with React and Material UI for easy operation.
+TMPVL AuditIQ is a production-grade, fully portable, offline-first enterprise application designed to audit, reconcile, and validate trainee billing submissions for **TMPVL**. The system automates the reconciliation process across three source workbooks (**BDC Master**, **Separations**, and **Vendor Invoices**), executing a comprehensive rule-based policy and fraud detection engine. It blocks duplicate claims, enforces strict tenure and annual payment caps, validates kit quantities, and maintains an immutable financial ledger.
 
 ---
 
-## 🏗️ Architecture & Technology Stack
+## 🏗️ Architecture
 
-Following a **Clean Architecture** pattern, the system runs locally on Windows and is designed for fully air-gapped (offline) environments.
+The application is structured following Clean Architecture principles to separate API routing, business domain rules, database access, and data models. It is designed to run locally in air-gapped environments without external network dependency.
 
-*   **Backend**: 
-    *   **FastAPI** (Python 3.12+) — Core REST API layer.
-    *   **SQLAlchemy ORM** — Database abstraction layer.
-    *   **SQLite** — Single-file, lightweight embedded relational database (`tmpvl_audit.db`).
-    *   **Pandas & OpenPyXL** — Excel data ingestion, manipulation, and custom spreadsheet generation.
-*   **Frontend**:
-    *   **React 19** + **TypeScript** — Component structure and strict static typing.
-    *   **Vite 8** — Fast compilation and bundling.
-    *   **Material UI v6 (MUI)** — Modern interface with responsive layouts.
-    *   **AG Grid** — Large-dataset table rendering with multi-column sorting and filtering.
-    *   **Recharts** — Dynamic SVG charts for billing anomalies and financial statistics.
-*   **Startup Utility**:
-    *   **Windows Command Batch Script** — Starts both services concurrently.
+### System Architecture Diagram
 
----
+```mermaid
+graph TD
+    subgraph Client [Frontend UI - React 19]
+        A[Dashboard & Analytics] -->|API Requests| B[Axios API Client]
+        C[Upload Panel] -->|Files & Form Data| B
+        D[Validation Engine View] -->|Trigger Validation| B
+    end
 
-## 🛡️ Auditing & Fraud Policy Engine Rules
+    subgraph Server [Backend REST Service - FastAPI]
+        B -->|REST Endpoints| E[endpoints.py Router]
+        E -->|Route Handlers| F[ImportService]
+        E -->|Route Handlers| G[ValidationService]
+        E -->|Route Handlers| H[LedgerService]
+        E -->|Route Handlers| I[ReportService]
+        
+        F -->|Ingests/Parses| J[WorkbookParser Engine]
+        G -->|Evaluates| K[Validation & Policy Rules]
+        
+        F & G & H & I -->|Database Transactions| L[Repositories CRUD Layer]
+    end
 
-The system passes all uploaded vendor invoices through a multi-layered validation engine, enforcing the following rules in a strict hierarchy:
-
-### Core Policy & Fraud Detection Rules
-1.  **Trainee Existence**: Rejects any record for a trainee not found in the BDC Master.
-2.  **Separation Checks**: Rejects payouts if the invoice date is after the trainee's separation date.
-3.  **30-Day Tenure Rule**: Trainees with a tenure of < 30 days are blocked from all payments.
-4.  **180-Day Tenure Rule**: Trainees separating before 180 days are ineligible for the 180-day payout (₹600).
-5.  **Duplicate Aadhaar/Ticket**: Flags as `FRAUD` if an Aadhaar or Ticket number is duplicated within an invoice or across the database for different trainees.
-6.  **Duplicate Billing**: Flags as `FRAUD` if a trainee is billed for the same payout type (Joining/180-Days) multiple times, either within the same invoice or against the historical ledger.
-7.  **Blocked Employee Billing**: Flags as `FRAUD` if a vendor bills for a trainee who is already marked as `BLOCKED`.
-
-### Payment & Quantity Cap Rules
-8.  **Joining Payment Limit**: Caps the total lifetime joining payment at **₹1200**.
-9.  **180-Day Payment Limit**: Caps the total lifetime 180-day payment at **₹600**.
-10. **Kit Quantity Validation**:
-    *   Rejects any `billed_other_amount` for uniforms or excess items.
-    *   Flags invoices claiming >5 shirts or >4 jeans and caps the total approval at **₹1200**.
-    *   Issues a warning for claims exceeding 3 shirts or 3 jeans.
-11. **Annual Maximum (Hard Cap)**: Enforces a strict lifetime payout cap of **₹1800** per trainee across all payments. This is the final check and will reduce any approved amounts to stay within the limit.
+    subgraph Storage [Database & Filesystem]
+        L -->|ORM Mapping| M[SQLite Database]
+        F -->|Saves Uploaded Workbooks| N[uploads/ Directory]
+        I -->|Writes Output Reports| O[reports/ Directory]
+    end
+    
+    style Client fill:#f9f,stroke:#333,stroke-width:2px
+    style Server fill:#bbf,stroke:#333,stroke-width:2px
+    style Storage fill:#dfd,stroke:#333,stroke-width:2px
+```
 
 ---
 
-## 📁 Repository Directory Structure
+## ✨ Features
+
+- **Automated Rule Engine**: Executes a comprehensive 11-point validation suite checking trainee existence, joining dates, separation details, and double claims.
+- **Fraud Detection Engine**: Flags duplicate Aadhaar/Ticket numbers, billing for blocked/separated employees, and repetitive submissions.
+- **Incremental & Full Sync**: Sync modes allow standard profile additions or strict master file alignment (automatically deactivating missing trainees).
+- **Centralized Config & Paths**: Built using `pathlib.Path` to resolve database, reports, and upload locations dynamically across Windows, Linux, and macOS.
+- **Immuntable Payment Ledger**: Keeps an audit history of approved disbursements and tracks remaining trainee caps under a lifetime ₹1800 limit.
+- **Multi-Format Ingestion**: Supports parsing from Excel workbooks (`.xlsx`, `.xls`) and PDF invoices.
+
+---
+
+## 🛠️ Technology Stack
+
+- **Backend**:
+  - **FastAPI** — High-performance ASGI web framework.
+  - **SQLAlchemy ORM** — Relational database mapping.
+  - **SQLite** — Lightweight, embedded single-file database.
+  - **Pandas & OpenPyXL** — Excel spreadsheet ingestion and generation.
+  - **pdfplumber** — Text extraction and parsing of PDF invoices.
+- **Frontend**:
+  - **React 19** + **TypeScript** — Single Page Application structure.
+  - **Vite 8** — Next-generation frontend tooling and bundler.
+  - **Material UI v6 (MUI)** — Component styling and layouts.
+  - **AG Grid** — High performance data grid tables.
+  - **Recharts** — Dynamic chart visualizations.
+
+---
+
+## 📁 Folder Structure
 
 ```text
-d:\TTBIS
+TMPVL-AuditIQ/
 ├── backend/
 │   ├── app/
 │   │   ├── api/
-│   │   │   └── endpoints.py          # FastAPI route controllers
+│   │   │   ├── endpoints.py          # REST API Route handlers
+│   │   │   └── schemas.py            # Pydantic request/response schemas
 │   │   ├── core/
-│   │   │   └── db.py                 # SQLite engine configuration & ORM Base
+│   │   │   ├── config.py             # Centralized configurations and logging
+│   │   │   └── db.py                 # SQLAlchemy engine & session configuration
 │   │   ├── models/
-│   │   │   └── models.py             # Database Schemas (SQLAlchemy)
+│   │   │   └── models.py             # SQLAlchemy models & schema definitions
 │   │   ├── repositories/
-│   │   │   └── repositories.py       # CRUD operations and SQL transactions
+│   │   │   └── repositories.py       # DB CRUD repository patterns
 │   │   └── services/
-│   │       ├── import_service.py     # Workbook ingestion (BDC, Separation, Invoice)
-│   │       ├── ledger_service.py     # Ledger accounting posting
-│   │       ├── report_service.py     # Excel Report compiler
-│   │       └── validation_service.py # Policy & Fraud rules engine
-│   ├── main.py                       # FastAPI application entry point
-│   ├── requirements.txt              # Backend python dependencies
-│   └── tests/
-│       └── test_validation.py        # Validation engine unittest suite
+│   │       ├── import_service.py     # Data workbook parser orchestrator
+│   │       ├── ledger_service.py     # Approved payout posting logic
+│   │       ├── report_service.py     # Custom Excel/CSV exporter
+│   │       ├── rules.py              # Individual policy validation rules
+│   │       ├── validation_service.py # Validation pipeline orchestrator
+│   │       └── workbook_parser.py    # Universal weighted excel classifier
+│   ├── main.py                       # Backend startup entrypoint
+│   ├── requirements.txt              # Backend dependencies
+│   └── tests/                        # Pytest suite
 ├── frontend/
-│   ├── public/                       # Static public assets
-│   ├── src/
-│   │   ├── components/               # Shared Layout headers and navigation
-│   │   ├── pages/                    # UI dashboard & workflow pages
-│   │   ├── api.ts                    # Axios wrapper config
-│   │   ├── App.tsx                   # Main routing tree
-│   │   ├── theme.ts                  # Material UI custom dark/light theme
-│   │   └── index.css                 # Global stylesheets
-│   ├── package.json                  # Node.js dependencies & scripts
-│   ├── tsconfig.json                 # TypeScript compiler configuration
-│   └── vite.config.ts                # Vite bundler configurations
-└── run_all.bat                       # Dual-service startup control script
+│   ├── src/                          # Frontend React source code
+│   ├── package.json                  # Node dependencies
+│   └── vite.config.ts                # Vite config
+├── .env.example                      # Environment variables template
+├── .gitignore                        # Git exclusion rules
+├── LICENSE                           # Project license
+└── run_all.py                        # Cross-platform service orchestrator
 ```
 
 ---
 
-## 🚀 Installation & Local Execution
+## ⚙️ Environment Variables
 
-Follow these steps to set up and run the system on a Windows machine.
+Copy the `.env.example` file in the project root to `.env` to customize settings:
+
+```bash
+cp .env.example .env
+```
+
+| Variable | Default Value | Description |
+| :--- | :--- | :--- |
+| `DATABASE_URL` | `sqlite:///backend/tmpvl_audit.db` | Path or connection URL to the SQLite database. |
+| `HOST` | `127.0.0.1` | IP address for backend server binding. |
+| `PORT` | `8000` | Port number for backend service. |
+| `FRONTEND_URL` | `http://localhost:5173` | Allowed frontend origin for CORS. |
+| `LOG_LEVEL` | `INFO` | Application log level (DEBUG, INFO, WARNING, ERROR). |
+| `MAX_UPLOAD_SIZE` | `52428800` | Maximum file size in bytes (50MB). |
+| `UPLOAD_DIRECTORY` | `uploads` | Directory where uploaded files are stored. |
+| `REPORT_DIRECTORY` | `reports` | Directory where exported reports are written. |
+| `TEMP_DIRECTORY` | `temp` | Directory for temporary file operations. |
+| `PARSER_VERSION` | `2.0.0` | Ingestion parser classification version. |
+
+---
+
+## 🚀 Installation & Setup
 
 ### Prerequisites
-*   **Python 3.12+** (configured in Windows path)
-*   **Node.js v20+** + **npm**
+- **Python**: Version 3.12 or newer.
+- **Node.js**: Version 20 or newer (npm included).
+- **Git**: Installed for cloning.
 
-### Step-by-Step Installation
-1.  **Clone / Open the repository**:
-    Ensure you are in the project folder `d:\TTBIS`.
+### 1. Clone the Repository
+```bash
+git clone https://github.com/maitray-agrawal/TMPVL-AuditIQ.git
+cd TMPVL-AuditIQ
+```
 
-2.  **Configure the Backend Environment**:
-    Create a virtual environment and install the required modules:
-    ```cmd
-    python -m venv .venv
-    call .venv\Scripts\activate
-    pip install -r backend/requirements.txt
-    ```
+### 2. Configure Virtual Environment
 
-3.  **Configure the Frontend Environment**:
-    Install all npm dependencies:
-    ```cmd
-    cd frontend
-    npm install
-    cd ..
-    ```
+#### Windows
+```cmd
+python -m venv .venv
+call .venv\Scripts\activate
+pip install -r backend/requirements.txt
+```
+
+#### Linux / macOS
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r backend/requirements.txt
+```
+
+### 3. Install Frontend Dependencies
+```bash
+cd frontend
+npm install
+cd ..
+```
 
 ---
 
-## ⚙️ Running the Application
+## 💻 Running the Application
 
-### Single-Click Execution (Recommended)
-Double-click the `run_all.bat` file in the root workspace directory, or launch it via the terminal:
-```cmd
-run_all.bat
+### Single-Command Orchestrator (Cross-Platform)
+Run the Python orchestrator script in the repository root. It automatically runs the backend server, starts the React dev client, and opens your web browser:
+```bash
+python run_all.py
 ```
-This script will:
-*   Spawn a command window starting the FastAPI service on `http://127.0.0.1:8000`.
-*   Spawn a command window starting the Vite frontend on `http://localhost:5173`.
-*   Automatically open your default browser to `http://localhost:5173/`.
 
-### Manual Service Execution
-If you prefer to run services manually:
+### Manual Execution
 
-**Backend Service**:
-```cmd
-call .venv\Scripts\activate
-set PYTHONPATH=.
+#### Backend Service
+```bash
+# Activate venv first, then:
+set PYTHONPATH=.      # Windows CMD
+$env:PYTHONPATH="."   # PowerShell
+export PYTHONPATH=.   # Linux/macOS
+
 python -m backend.main
 ```
-```
-set PYTHONPATH=.python -m backend.main
-PYTHONPATH=. .venv/bin/python -m pytest backend/tests
 
-```
-
-**Frontend Client**:
-```cmd
+#### Frontend Client
+```bash
 cd frontend
 npm run dev
 ```
 
 ---
 
-## 🧪 Running Backend Unit Tests
+## 🧪 Running Tests
 
-A comprehensive unit test suite validates the policy engine, fraud detection, and data import services against an in-memory SQLite database. Run all tests using `pytest` or a specific suite with `unittest`.
-
-```cmd
-call .venv\Scripts\activate
-python -m pytest tests/ -v
+Verify backend logic and business rules by executing pytest in the root or backend directory:
+```bash
+# Ensure virtual environment is active
+.venv/bin/python3 -m pytest   # Linux/macOS
+.venv\Scripts\python -m pytest  # Windows
 ```
 
 ---
 
-## 📖 Operational Workflow
+## 📖 Sample Workflow
 
-1.  **BDC Ingestion**: Head to the **BDC Upload** page and upload the BDC Master sheet to load active trainee profiles and their baseline details into the system.
-2.  **Separation Ingestion**: Upload the Separation registers in the **Separation Upload** page to record resignations and update trainees' DOL (Date of Leaving) records.
-3.  **Invoice Upload**: Importer a billing invoice spreadsheet from Quess.
-4.  **Audit / Reconciliation**: Open the **Validation Engine**, select the pending invoice, and click **Run Rules Validation**. The engine will highlight and flag violations (Warnings, Errors, or Fraud) line-by-line.
-5.  **payout Ledger Approval**: Click **Approve Invoice Payouts** to lock approved figures and write validated financial entries to the ledger.
-6.  **Reports**: Download custom-compiled audit spreadsheets, exception reports, or summaries from the **Reports** portal.
+```text
+BDC Upload (Ingests active trainee profiles)
+      ↓
+Separation Upload (Ingests exit/DOL records)
+      ↓
+Invoice Upload (Ingests Quess vendor billing claims)
+      ↓
+Validation Engine (Performs 11-point policy checks)
+      ↓
+Fraud Detection (Flags duplicate IDs, blocked billings)
+      ↓
+Reconciliation (Caps joining/180-day payouts, saves ledger)
+      ↓
+Reports Export (Generates approved payouts and exception sheets)
+```
+
+1. **BDC Upload**: Upload the master sheet containing active trainees to establish profiles.
+2. **Separation Upload**: Upload separation files to record leaving dates (DOL) and exit statuses.
+3. **Invoice Upload**: Upload Quess vendor claim Excel or PDF invoices.
+4. **Validation & Fraud**: Run the validation engine to identify warnings, errors, or fraud flags.
+5. **Reconciliation & Ledger**: Approve the invoice. Payout limits are automatically updated, and details are logged to the immutable ledger.
+6. **Reports**: Download approved payout lists, exception sheets, or executive summaries.
+
+---
+
+## ❓ Troubleshooting & FAQ
+
+**Q: Database locked errors occur during validation.**
+- **A**: The system enforces a 30-second database busy timeout. Ensure no external SQLite clients have active write transactions on `tmpvl_audit.db`.
+
+**Q: Invoices are not showing up under validation.**
+- **A**: Make sure the uploaded sheets are classified properly. Check the backend logs for `DETAILED PARSER DEBUG LOG` output to confirm headers and scores.
+
+**Q: Frontend build fails.**
+- **A**: Clean your node modules (`rm -rf node_modules` / `rm -rf frontend/node_modules`) and run `npm install` again.
+
+---
+
+## 📋 Supported Specifications
+
+- **Supported Operating Systems**: Windows (10/11), Ubuntu/Debian (20.04+), macOS (Monterey+)
+- **Python Version**: `>=3.12`
+- **Node.js Version**: `>=20`
+- **Browser Compatibility**: Chrome (latest), Edge (latest), Firefox (latest), Safari (latest)
+
+---
+
+## 📄 License
+This project is licensed under the MIT License - see the LICENSE file for details.

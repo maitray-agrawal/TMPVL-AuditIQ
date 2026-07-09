@@ -12,10 +12,12 @@ from backend.main import app
 from backend.app.models.models import Trainee, BDCRecord, SeparationRecord, UploadHistory, TraineeLifecycle, ValidationResult, InvoiceRecord
 from backend.app.services.import_service import ImportService
 
+from backend.app.core.config import BASE_DIR
+
 class TestMasterSyncEnterprise(unittest.TestCase):
     def setUp(self):
         # 1. Setup SQLite file DB for tests to allow multi-connection visibility
-        self.db_path = "/home/ubuntu/Desktop/Tata Projects/TMPVL AuditIQ/test_db.sqlite"
+        self.db_path = (BASE_DIR / "test_db.sqlite").as_posix()
         if os.path.exists(self.db_path):
             try:
                 os.remove(self.db_path)

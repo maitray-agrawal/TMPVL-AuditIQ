@@ -112,9 +112,9 @@ class ValidationService:
             "min_days_reimbursement": 30
         }
 
+        from backend.app.core.config import BASE_DIR
         settings_paths = [
-            "settings_config.json",
-            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "settings_config.json")
+            (BASE_DIR / "settings_config.json").as_posix()
         ]
         for path in settings_paths:
             if os.path.exists(path):
