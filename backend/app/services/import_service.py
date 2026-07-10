@@ -132,10 +132,22 @@ class ImportService:
     @classmethod
     def _process_employee_master_sheet(cls, db: Session, sheet: Dict[str, Any], file_name: str, BATCH_SIZE: int, state: Dict[str, Any]) -> None:
         import time
+        import uuid
+        import logging
+        import re
+        logger = logging.getLogger("workbook_parser")
+        
         sheet_name = sheet["sheet_name"]
         sheet_inserted = 0
         sheet_updated = 0
+        sheet_incomplete_inserted = 0
+        sheet_incomplete_updated = 0
+        sheet_duplicate_updated = 0
+        sheet_identity_conflict = 0   # Missing mandatory identity (Ticket)
+        sheet_aadhaar_conflict = 0    # Aadhaar-based fraud / manual review
+        sheet_blank = 0
         sheet_failed = 0
+        
         sheet_start_time = time.time()
         sheet_before_state = {}
         sheet_after_state = {}
@@ -144,7 +156,6 @@ class ImportService:
         first_row = sheet["rows"][0] if sheet["rows"] else {}
         sheet_category, sheet_scheme = cls.derive_category_and_scheme(sheet_name, first_row, file_name)
 
-        # Check if offer_id column is present in sheet headers (original or normalized)
         has_offer_id_col = False
         for orig_h in sheet["original_headers"]:
             norm_h = WorkbookParser.normalize_header(orig_h)
@@ -155,123 +166,96 @@ class ImportService:
         if not has_offer_id_col:
             state["warnings"].append(f"Sheet '{sheet_name}': Missing optional/historical column 'offer_id'.")
 
+        # Check if columns exist in the sheet headers
+        has_ticket_col = False
+        has_aadhaar_col = False
+        for orig_h in sheet["original_headers"]:
+            norm_h = WorkbookParser.normalize_header(orig_h)
+            if norm_h in WorkbookParser.SYNONYMS["ticket_number"]:
+                has_ticket_col = True
+            if norm_h in WorkbookParser.SYNONYMS["aadhaar"]:
+                has_aadhaar_col = True
+
         seen_trainee_ids = set()
-        seen_aadhaars = set()
         seen_tickets = set()
+        all_synonyms = set()
+        for syns in WorkbookParser.SYNONYMS.values():
+            all_synonyms.update(syns)
 
         def process_batch(rows_to_process):
-            nonlocal sheet_inserted, sheet_updated, sheet_failed
-            valid_rows = []
+            nonlocal sheet_inserted, sheet_updated, sheet_incomplete_inserted, sheet_incomplete_updated, sheet_duplicate_updated, sheet_identity_conflict, sheet_aadhaar_conflict, sheet_blank, sheet_failed
+            
+            # Extract standard key mappings for bulk database lookups
             batch_trainee_ids = set()
-            batch_aadhaars = set()
             batch_tickets = set()
-
+            batch_aadhaars = set()
+            
+            cleaned_rows = []
+            
             for row in rows_to_process:
                 row_num = row["_row_num"]
                 state["rows_processed"] += 1
-                try:
-                    # Get standard key values
-                    r_id = row.get("trainee_id") or ""
-                    r_ticket = row.get("ticket_number") or ""
-                    r_name = row.get("candidate_name") or ""
-                    r_doj = row.get("joining_date")
-                    r_offer_id = row.get("offer_id") or ""
-                    r_aadhaar = row.get("aadhaar") or ""
-                    r_mobile = row.get("mobile") or ""
-                    r_email = row.get("email") or ""
-                    
-                    r_category, r_scheme = cls.derive_category_and_scheme(sheet_name, row, file_name)
-                    
-                    # Clean fields
-                    r_name = str(r_name).strip()
-                    r_aadhaar = r_aadhaar.replace(" ", "").replace("-", "") if r_aadhaar else ""
-                    r_ticket = str(r_ticket).strip()
-                    r_batch = str(row.get("batch") or "").strip()
-                    r_shop = str(row.get("shop") or "").strip()
+                
+                # Ignore blank rows: if all keys except '_row_num' are blank/None/empty
+                is_blank = True
+                for k, v in row.items():
+                    if k != "_row_num" and v is not None and str(v).strip() != "":
+                        is_blank = False
+                        break
+                if is_blank:
+                    sheet_blank += 1
+                    continue
 
-                    # Validate required fields
-                    if not r_name or r_name.lower() == 'nan' or not r_doj:
-                        state["skipped_count"] += 1
-                        state["error_count"] += 1
-                        sheet_failed += 1
-                        state["errors"].append(f"Sheet '{sheet_name}', Row {row_num}: Missing Name or Date of Joining.")
-                        continue
-                        
-                    if not r_id and not r_ticket:
-                        state["skipped_count"] += 1
-                        state["error_count"] += 1
-                        sheet_failed += 1
-                        state["errors"].append(f"Sheet '{sheet_name}', Row {row_num}: Missing both Trainee ID and Ticket Number.")
-                        continue
+                r_id = str(row.get("trainee_id") or "").strip()
+                r_ticket = str(row.get("ticket_number") or "").strip()
+                r_name = str(row.get("candidate_name") or "").strip()
+                r_doj = row.get("joining_date")
+                r_offer_id = str(row.get("offer_id") or "").strip()
+                r_aadhaar = str(row.get("aadhaar") or "").strip()
+                r_aadhaar = r_aadhaar.replace(" ", "").replace("-", "") if r_aadhaar else ""
+                r_mobile = str(row.get("mobile") or "").strip()
+                r_email = str(row.get("email") or "").strip()
+                r_batch = str(row.get("batch") or "").strip()
+                r_shop = str(row.get("shop") or "").strip()
+                
+                # Clean nan strings
+                if r_id.lower() == 'nan': r_id = ""
+                if r_ticket.lower() == 'nan': r_ticket = ""
+                if r_name.lower() == 'nan': r_name = ""
+                if r_offer_id.lower() == 'nan': r_offer_id = ""
+                if r_aadhaar.lower() == 'nan': r_aadhaar = ""
+                if r_mobile.lower() == 'nan': r_mobile = ""
+                if r_email.lower() == 'nan': r_email = ""
+                if r_batch.lower() == 'nan': r_batch = ""
+                if r_shop.lower() == 'nan': r_shop = ""
 
-                    # If offer_id column is present, enforce it strictly per row
-                    if has_offer_id_col and not r_offer_id:
-                        state["skipped_count"] += 1
-                        state["error_count"] += 1
-                        sheet_failed += 1
-                        state["errors"].append(f"Sheet '{sheet_name}', Row {row_num}: Missing required field: offer_id.")
-                        continue
+                r_category, r_scheme = cls.derive_category_and_scheme(sheet_name, row, file_name)
 
-                    # Duplicates within the sheet validation
-                    if r_id:
-                        if r_id in seen_trainee_ids:
-                            state["skipped_count"] += 1
-                            state["duplicate_count"] += 1
-                            state["error_count"] += 1
-                            sheet_failed += 1
-                            state["errors"].append(f"Sheet '{sheet_name}', Row {row_num}: Duplicate Trainee ID '{r_id}' within the sheet.")
-                            continue
-                        seen_trainee_ids.add(r_id)
-                        batch_trainee_ids.add(r_id)
-                        
-                    if r_aadhaar:
-                        if r_aadhaar in seen_aadhaars:
-                            state["skipped_count"] += 1
-                            state["duplicate_count"] += 1
-                            state["error_count"] += 1
-                            sheet_failed += 1
-                            state["errors"].append(f"Sheet '{sheet_name}', Row {row_num}: Duplicate Aadhaar '{r_aadhaar}' within the sheet.")
-                            continue
-                        seen_aadhaars.add(r_aadhaar)
-                        batch_aadhaars.add(r_aadhaar)
-                        
-                    if r_ticket:
-                        if r_ticket in seen_tickets:
-                            state["skipped_count"] += 1
-                            state["duplicate_count"] += 1
-                            state["error_count"] += 1
-                            sheet_failed += 1
-                            state["errors"].append(f"Sheet '{sheet_name}', Row {row_num}: Duplicate Ticket '{r_ticket}' within the sheet.")
-                            continue
-                        seen_tickets.add(r_ticket)
-                        batch_tickets.add(r_ticket)
+                cleaned_rows.append({
+                    "row_num": row_num,
+                    "id": r_id,
+                    "ticket": r_ticket,
+                    "name": r_name,
+                    "doj": r_doj,
+                    "offer_id": r_offer_id,
+                    "aadhaar": r_aadhaar,
+                    "mobile": r_mobile,
+                    "email": r_email,
+                    "batch": r_batch,
+                    "shop": r_shop,
+                    "category": r_category,
+                    "scheme": r_scheme,
+                    "raw_row": row
+                })
+                
+                if r_id: batch_trainee_ids.add(r_id)
+                if r_ticket: batch_tickets.add(r_ticket)
+                if r_aadhaar: batch_aadhaars.add(r_aadhaar)
 
-                    valid_rows.append({
-                        "row_num": row_num,
-                        "id": r_id,
-                        "name": r_name,
-                        "doj": r_doj,
-                        "category": r_category,
-                        "scheme": r_scheme,
-                        "aadhaar": r_aadhaar,
-                        "ticket": r_ticket,
-                        "batch": r_batch,
-                        "shop": r_shop,
-                        "offer_id": r_offer_id,
-                        "mobile": r_mobile,
-                        "email": r_email,
-                        "raw_row": row
-                    })
-                except Exception as e:
-                    state["skipped_count"] += 1
-                    state["error_count"] += 1
-                    sheet_failed += 1
-                    state["errors"].append(f"Sheet '{sheet_name}', Row {row_num}: Error parsing columns: {str(e)}")
-
-            if not valid_rows:
+            if not cleaned_rows:
                 return
 
-            # Bulk lookups for database checks
+            # Bulk lookups for database identity checks
             existing_by_id = {}
             if batch_trainee_ids:
                 res_ids = db.query(Trainee).filter(Trainee.id.in_(batch_trainee_ids)).all()
@@ -285,49 +269,111 @@ class ImportService:
                 res_aadhaars = db.query(Trainee).filter(Trainee.aadhaar.in_(batch_aadhaars)).all()
                 existing_by_aadhaar = {t.aadhaar: t for t in res_aadhaars}
 
-            for item in valid_rows:
+            for item in cleaned_rows:
                 row_num = item["row_num"]
                 try:
                     r_id = item["id"]
+                    r_ticket = item["ticket"]
                     r_name = item["name"]
                     r_doj = item["doj"]
-                    r_category = item["category"]
-                    r_scheme = item["scheme"]
-                    r_aadhaar = item["aadhaar"]
-                    r_ticket = item["ticket"]
-                    r_batch = item["batch"]
-                    r_shop = item["shop"]
                     r_offer_id = item["offer_id"]
+                    r_aadhaar = item["aadhaar"]
                     r_mobile = item["mobile"]
                     r_email = item["email"]
+                    r_batch = item["batch"]
+                    r_shop = item["shop"]
+                    r_category = item["category"]
+                    r_scheme = item["scheme"]
                     raw_row = item["raw_row"]
 
-                    # Cross-trainee database checks
-                    if r_ticket and r_ticket in existing_by_ticket:
-                        ticket_owner = existing_by_ticket[r_ticket]
-                        if r_id and ticket_owner.id != r_id:
-                            state["skipped_count"] += 1
-                            state["error_count"] += 1
-                            sheet_failed += 1
-                            state["errors"].append(f"Sheet '{sheet_name}', Row {row_num}: Ticket '{r_ticket}' already exists for another trainee '{ticket_owner.id}' in database.")
-                            continue
-                            
-                    if r_aadhaar and r_aadhaar in existing_by_aadhaar:
-                        aadhaar_owner = existing_by_aadhaar[r_aadhaar]
-                        if r_id and aadhaar_owner.id != r_id:
-                            state["skipped_count"] += 1
-                            state["error_count"] += 1
-                            sheet_failed += 1
-                            state["errors"].append(f"Sheet '{sheet_name}', Row {row_num}: Aadhaar '{r_aadhaar}' already exists for another trainee '{aadhaar_owner.id}' in database.")
-                            continue
+                    # 1. Missing Identity Check — Ticket Number is primary identity.
+                    #    Aadhaar alone is not sufficient to reject a row; it is used
+                    #    only for lifecycle / fraud checks (Step 3 below).
+                    identity_missing = False
+                    if has_ticket_col and not r_ticket:
+                        # Ticket column exists but this row has no value → reject
+                        identity_missing = True
+                    elif not has_ticket_col and not r_id:
+                        # No ticket col and no trainee_id → reject
+                        identity_missing = True
 
+                    if identity_missing:
+                        sheet_identity_conflict += 1
+                        state["skip_count"] += 1
+                        print(f"Sheet : {sheet_name} | Excel Row : {row_num} | Ticket : {r_ticket or 'MISSING'} | Identity Incomplete (no Ticket No.) | Status : IDENTITY_INCOMPLETE")
+                        logger.warning(f"Sheet : {sheet_name} | Excel Row : {row_num} | Ticket : {r_ticket or 'MISSING'} | Identity Incomplete (no Ticket No.) | Status : IDENTITY_INCOMPLETE")
+                        continue
+
+                    # 2. Identity Resolution — Ticket Number has priority
                     trainee = None
-                    if r_ticket and r_ticket in existing_by_ticket:
+                    if r_ticket in existing_by_ticket:
                         trainee = existing_by_ticket[r_ticket]
-                    if not trainee and r_id and r_id in existing_by_id:
+                    elif r_id in existing_by_id:
                         trainee = existing_by_id[r_id]
-                    if not trainee and r_aadhaar and r_aadhaar in existing_by_aadhaar:
-                        trainee = existing_by_aadhaar[r_aadhaar]
+
+                    # 3. Aadhaar-based lifecycle / fraud detection
+                    #
+                    #  Case A: Same Aadhaar, same Ticket → normal update (handled by Step 2 already)
+                    #  Case B: Same Aadhaar, NEW Ticket, previous lifecycle SEPARATED/BLOCKED
+                    #          → this is a RE-HIRE, NOT fraud — allow via rehire logic below
+                    #  Case C: Same Aadhaar, NEW Ticket, previous lifecycle ACTIVE
+                    #          → FRAUD: Multiple Active Tickets under same Aadhaar
+                    #  Case D: Same Aadhaar, different person (Aadhaar already owned by a
+                    #          completely different matched trainee) → manual review
+                    if r_aadhaar:
+                        aadhaar_owner = existing_by_aadhaar.get(r_aadhaar)
+                        if aadhaar_owner:
+                            if trainee and trainee.id == aadhaar_owner.id:
+                                # Case A — same person, same ticket → normal update, no action here
+                                pass
+                            elif trainee and trainee.id != aadhaar_owner.id:
+                                # Case D — Ticket resolves to one person but Aadhaar to another
+                                sheet_aadhaar_conflict += 1
+                                state["skip_count"] += 1
+                                msg = (f"Sheet : {sheet_name} | Excel Row : {row_num} | Ticket : {r_ticket} | "
+                                       f"FRAUD/MANUAL-REVIEW: Aadhaar {r_aadhaar} already belongs to a different "
+                                       f"employee (ID: {aadhaar_owner.id}, Ticket: {aadhaar_owner.ticket_number})")
+                                print(msg)
+                                logger.warning(msg)
+                                continue
+                            elif not trainee:
+                                # Aadhaar found but ticket didn't match → check lifecycle
+                                prev_status = aadhaar_owner.status
+                                if prev_status in ("SEPARATED", "BLOCKED"):
+                                    # Case B — re-hire under new ticket; proceed normally
+                                    # The rehire logic in Step 5 will archive the old lifecycle
+                                    trainee = aadhaar_owner
+                                    msg = (f"Sheet : {sheet_name} | Excel Row : {row_num} | Ticket : {r_ticket} | "
+                                           f"RE-HIRE detected: Aadhaar {r_aadhaar} was previously {prev_status} "
+                                           f"under ticket {aadhaar_owner.ticket_number}. Creating new lifecycle.")
+                                    print(msg)
+                                    logger.info(msg)
+                                elif prev_status == "ACTIVE":
+                                    # Case C — same Aadhaar, two different active tickets → fraud
+                                    sheet_aadhaar_conflict += 1
+                                    state["skip_count"] += 1
+                                    msg = (f"Sheet : {sheet_name} | Excel Row : {row_num} | Ticket : {r_ticket} | "
+                                           f"FRAUD: Aadhaar {r_aadhaar} is ACTIVE under ticket "
+                                           f"{aadhaar_owner.ticket_number}. Cannot create duplicate active record.")
+                                    print(msg)
+                                    logger.warning(msg)
+                                    continue
+                                else:
+                                    # Unknown status — allow as re-hire with a warning
+                                    trainee = aadhaar_owner
+                                    msg = (f"Sheet : {sheet_name} | Excel Row : {row_num} | Ticket : {r_ticket} | "
+                                           f"WARNING: Aadhaar {r_aadhaar} resolved to existing employee "
+                                           f"(status={prev_status}). Treating as update.")
+                                    print(msg)
+                                    logger.warning(msg)
+
+                    # 4. Duplicate Sheet Detection
+                    is_duplicate_updated = False
+                    if r_ticket in seen_tickets:
+                        is_duplicate_updated = True
+                    seen_tickets.add(r_ticket)
+                    if r_id:
+                        seen_trainee_ids.add(r_id)
 
                     resolved_id = trainee.id if trainee else (r_id if r_id else r_ticket)
                     
@@ -335,10 +381,90 @@ class ImportService:
                         state["processed_ids"] = set()
                     state["processed_ids"].add(resolved_id)
 
+                    # 5. Missing Data Quality Checks
+                    missing_fields = []
+                    if not r_name:
+                        r_name = "MISSING"
+                        missing_fields.append("Name")
+                    if not r_doj:
+                        r_doj = None
+                        missing_fields.append("DOJ")
+                    if not r_offer_id:
+                        r_offer_id = "MISSING"
+                        missing_fields.append("Offer ID")
+                    if not r_mobile:
+                        r_mobile = "MISSING"
+                        missing_fields.append("Mobile")
+                    if not r_email:
+                        r_email = "MISSING"
+                        missing_fields.append("Email")
+                    if not r_shop:
+                        r_shop = "MISSING"
+                        missing_fields.append("Shop")
+                    if not r_category or r_category == "UNKNOWN":
+                        missing_fields.append("Category")
+                        if not r_category:
+                            r_category = "UNKNOWN"
+
+                    validation_status = "INCOMPLETE" if missing_fields else "COMPLETE"
+                    validation_metadata = {
+                        "validation_status": validation_status,
+                        "missing_fields": missing_fields
+                    }
+
+                    # Determine if any fields actually changed
+                    changed = False
+                    if trainee:
+                        if (trainee.name != r_name or
+                            trainee.doj != r_doj or
+                            trainee.category != r_category or
+                            trainee.scheme != r_scheme or
+                            trainee.batch != (r_batch or None) or
+                            trainee.shop != (r_shop or None) or
+                            (r_aadhaar and trainee.aadhaar != r_aadhaar) or
+                            (r_ticket and trainee.ticket_number != r_ticket) or
+                            trainee.offer_id != (r_offer_id or None) or
+                            trainee.mobile != (r_mobile or None) or
+                            trainee.email != (r_email or None)):
+                            changed = True
+
+                    # Determine reconciliation category
+                    if is_duplicate_updated:
+                        sheet_duplicate_updated += 1
+                        state["updated_count"] += 1
+                        print("Duplicate Ticket")
+                        print("Existing Updated")
+                        print("Duplicate Ticket")
+                        print("Updated Existing Employee")
+                        logger.warning(f"Duplicate Ticket | Existing Updated | Row: {row_num}")
+                    else:
+                        if trainee:
+                            if changed:
+                                state["updated_count"] += 1
+                                if missing_fields:
+                                    sheet_incomplete_updated += 1
+                                else:
+                                    sheet_updated += 1
+                            else:
+                                state["skip_count"] += 1
+                                if missing_fields:
+                                    sheet_incomplete_updated += 1
+                                else:
+                                    sheet_updated += 1
+                        else:
+                            state["created_count"] += 1
+                            if missing_fields:
+                                sheet_incomplete_inserted += 1
+                            else:
+                                sheet_inserted += 1
+
+                    # Log incomplete rows as WARNING
+                    if missing_fields:
+                        missing_str = ", ".join(missing_fields)
+                        print(f"Sheet : {sheet_name} | Excel Row : {row_num} | Ticket : {r_ticket} | Imported | Status : INCOMPLETE | Missing: {missing_str}")
+                        logger.warning(f"Sheet : {sheet_name} | Excel Row : {row_num} | Ticket : {r_ticket} | Imported | Status : INCOMPLETE | Missing: {missing_str}")
+
                     # Extract unknown columns
-                    all_synonyms = set()
-                    for syns in WorkbookParser.SYNONYMS.values():
-                        all_synonyms.update(syns)
                     unknown_data = {}
                     for k, val in raw_row.items():
                         if k not in WorkbookParser.SYNONYMS and k not in all_synonyms and not k.startswith('_'):
@@ -347,12 +473,15 @@ class ImportService:
                     if trainee:
                         if trainee.id not in sheet_before_state:
                             sheet_before_state[trainee.id] = cls._serialize_trainee_state(trainee)
+                        
+                        # Rehire check
                         is_rehire = False
                         if trainee.status in ("SEPARATED", "BLOCKED"):
-                            if trainee.dol and r_doj > trainee.dol and r_doj != trainee.doj:
+                            if trainee.dol and r_doj and r_doj > trainee.dol and r_doj != trainee.doj:
                                 is_rehire = True
 
                         if is_rehire:
+                            # Archive previous lifecycle to TraineeLifecycle
                             prev_doj = trainee.doj
                             prev_invoices = []
                             prev_ledger = []
@@ -419,150 +548,79 @@ class ImportService:
                                     if latest_sep:
                                         reason = latest_sep.reason or "Separated"
 
-                            # Archive previous lifecycle to TraineeLifecycle table
-                            old_lc = TraineeLifecycle(
-                                trainee_id=trainee.id,
-                                joining_date=trainee.doj,
-                                leaving_date=trainee.dol,
-                                status=trainee.status,
-                                upload_id=state.get("upload_id"),
-                                extra_data={
-                                    "invoice_history": prev_invoices,
-                                    "payment_ledger": prev_ledger,
-                                    "validation_history": prev_validations,
-                                    "reason": reason,
-                                    "category": trainee.category,
-                                    "batch": trainee.batch,
-                                    "shop": trainee.shop,
-                                    "bdc_workbook": trainee.current_workbook,
-                                    "bdc_sheet": trainee.current_sheet
-                                }
-                            )
-                            db.add(old_lc)
-                            db.flush()
+                            # Guard: only create a lifecycle archive if separation upload
+                            # hasn't already written one for the same date range.
+                            existing_lc = db.query(TraineeLifecycle).filter(
+                                TraineeLifecycle.trainee_id == trainee.id,
+                                TraineeLifecycle.joining_date == trainee.doj,
+                                TraineeLifecycle.leaving_date == trainee.dol,
+                            ).first()
+                            if not existing_lc:
+                                old_lc = TraineeLifecycle(
+                                    trainee_id=trainee.id,
+                                    joining_date=trainee.doj,
+                                    leaving_date=trainee.dol,
+                                    status=trainee.status,
+                                    upload_id=state.get("upload_id"),
+                                    extra_data={
+                                        "invoice_history": prev_invoices,
+                                        "payment_ledger": prev_ledger,
+                                        "validation_history": prev_validations,
+                                        "reason": reason,
+                                        "category": trainee.category,
+                                        "batch": trainee.batch,
+                                        "shop": trainee.shop,
+                                        "bdc_workbook": trainee.current_workbook,
+                                        "bdc_sheet": trainee.current_sheet
+                                    }
+                                )
+                                db.add(old_lc)
+                                db.flush()
+                            state["rows_rehired"] += 1
 
-                            trainee.name = r_name
-                            trainee.category = r_category
-                            trainee.scheme = r_scheme
-                            trainee.batch = r_batch or None
-                            trainee.shop = r_shop or None
-                            trainee.doj = r_doj
                             trainee.dol = None
                             trainee.status = "ACTIVE"
                             trainee.blocked_reason = None
-                            if r_aadhaar:
-                                trainee.aadhaar = r_aadhaar
-                            if r_ticket:
-                                trainee.ticket_number = r_ticket
-                            
-                            trainee.offer_id = r_offer_id
-                            trainee.mobile = r_mobile
-                            trainee.email = r_email
-                            
-                            # Merge extra_data
-                            ext_data = trainee.extra_data or {}
-                            ext_data["offer_id"] = r_offer_id
-                            ext_data["mobile"] = r_mobile
-                            ext_data["email"] = r_email
-                            for k, val in unknown_data.items():
-                                ext_data[k] = val
-                            trainee.extra_data = make_json_serializable(ext_data)
 
-                            trainee.current_workbook = file_name
-                            trainee.current_sheet = sheet_name
+                        # Update existing fields
+                        trainee.name = r_name
+                        if r_doj is not None:
+                            trainee.doj = r_doj
+                        trainee.category = r_category
+                        trainee.scheme = r_scheme
+                        trainee.batch = r_batch or None
+                        trainee.shop = r_shop or None
+                        if r_aadhaar:
+                            trainee.aadhaar = r_aadhaar
+                        if r_ticket:
+                            trainee.ticket_number = r_ticket
+                        trainee.offer_id = r_offer_id or None
+                        trainee.mobile = r_mobile or None
+                        trainee.email = r_email or None
 
-                            sheet_updated += 1
-                            state["updated_count"] += 1
-                            state["rows_rehired"] += 1
-                            sheet_after_state[trainee.id] = cls._serialize_trainee_state(trainee)
-                        else:
-                            changed = False
-                            if trainee.name != r_name:
-                                trainee.name = r_name
-                                changed = True
-                                
-                            if trainee.status not in ("SEPARATED", "BLOCKED", "INACTIVE"):
-                                if trainee.doj != r_doj:
-                                    trainee.doj = r_doj
-                                    changed = True
+                        ext_data = trainee.extra_data or {}
+                        ext_data["offer_id"] = r_offer_id
+                        ext_data["mobile"] = r_mobile
+                        ext_data["email"] = r_email
+                        ext_data["validation_metadata"] = validation_metadata
+                        for k, val in unknown_data.items():
+                            ext_data[k] = val
+                        trainee.extra_data = make_json_serializable(ext_data)
 
-                            if (trainee.category or "") != (r_category or ""):
-                                trainee.category = r_category
-                                changed = True
+                        trainee.current_workbook = file_name
+                        trainee.current_sheet = sheet_name
 
-                            if (trainee.scheme or "") != r_scheme:
-                                trainee.scheme = r_scheme
-                                changed = True
-
-                            if (trainee.batch or "") != (r_batch or ""):
-                                trainee.batch = r_batch or None
-                                changed = True
-
-                            if (trainee.shop or "") != (r_shop or ""):
-                                trainee.shop = r_shop or None
-                                changed = True
-
-                            if r_aadhaar and (trainee.aadhaar or "") != r_aadhaar:
-                                trainee.aadhaar = r_aadhaar
-                                changed = True
-
-                            if r_ticket and (trainee.ticket_number or "") != r_ticket:
-                                trainee.ticket_number = r_ticket
-                                changed = True
-
-                            if (trainee.offer_id or "") != r_offer_id:
-                                trainee.offer_id = r_offer_id
-                                changed = True
-                            if (trainee.mobile or "") != r_mobile:
-                                trainee.mobile = r_mobile
-                                changed = True
-                            if (trainee.email or "") != r_email:
-                                trainee.email = r_email
-                                changed = True
-
-                            # Save new extra_data fields
-                            ext_data = trainee.extra_data or {}
-                            ext_changed = False
-                            if ext_data.get("offer_id") != r_offer_id:
-                                ext_data["offer_id"] = r_offer_id
-                                ext_changed = True
-                            if ext_data.get("mobile") != r_mobile:
-                                ext_data["mobile"] = r_mobile
-                                ext_changed = True
-                            if ext_data.get("email") != r_email:
-                                ext_data["email"] = r_email
-                                ext_changed = True
-                            for k, val in unknown_data.items():
-                                if ext_data.get(k) != val:
-                                    ext_data[k] = val
-                                    ext_changed = True
-                                    
-                            if ext_changed:
-                                trainee.extra_data = make_json_serializable(ext_data)
-                                changed = True
-
-                            if trainee.current_workbook != file_name or trainee.current_sheet != sheet_name:
-                                trainee.current_workbook = file_name
-                                trainee.current_sheet = sheet_name
-
-                            if changed:
-                                if trainee.status not in ("SEPARATED", "BLOCKED"):
-                                    trainee.status = "ACTIVE"
-                                sheet_updated += 1
-                                state["updated_count"] += 1
-                                sheet_after_state[trainee.id] = cls._serialize_trainee_state(trainee)
-                            else:
-                                if trainee.status == "BLOCKED":
-                                    state["blocked_count"] += 1
-                                elif trainee.status == "SEPARATED":
-                                    state["separated_count"] += 1
-                                state["rows_no_change"] += 1
-                                state["skip_count"] += 1
+                        if trainee.status not in ("SEPARATED", "BLOCKED"):
+                            trainee.status = "ACTIVE"
+                        
+                        sheet_after_state[trainee.id] = cls._serialize_trainee_state(trainee)
                     else:
+                        # Create new Trainee
                         ext_data = {
                             "offer_id": r_offer_id,
                             "mobile": r_mobile,
-                            "email": r_email
+                            "email": r_email,
+                            "validation_metadata": validation_metadata
                         }
                         for k, val in unknown_data.items():
                             ext_data[k] = val
@@ -591,10 +649,10 @@ class ImportService:
                             existing_by_ticket[r_ticket] = new_trainee
                         if r_aadhaar:
                             existing_by_aadhaar[r_aadhaar] = new_trainee
-                        sheet_inserted += 1
-                        state["created_count"] += 1
+                        
                         sheet_after_state[resolved_id] = cls._serialize_trainee_state(new_trainee)
 
+                    # Add BDCRecord
                     bdc_rec = BDCRecord(
                         trainee_id=resolved_id,
                         doj=r_doj,
@@ -615,10 +673,12 @@ class ImportService:
                     )
                     db.add(bdc_rec)
                     state["success_count"] += 1
+                    
                 except Exception as e:
-                    state["skipped_count"] += 1
-                    state["error_count"] += 1
+                    import traceback
+                    traceback.print_exc()
                     sheet_failed += 1
+                    state["error_count"] += 1
                     state["errors"].append(f"Sheet '{sheet_name}', Row {row_num}: Database operation failed: {str(e)}")
 
             db.flush()
@@ -628,20 +688,53 @@ class ImportService:
             process_batch(sheet["rows"][i:i+BATCH_SIZE])
 
         sheet_duration = time.time() - sheet_start_time
+        
+        parsed_rows = len(sheet["rows"]) + sheet["blank_rows"]
+        sheet_incomplete = sheet_incomplete_inserted + sheet_incomplete_updated
+        total_accounted = (sheet_inserted + sheet_updated + sheet_incomplete + 
+                           sheet_duplicate_updated + sheet_identity_conflict +
+                           sheet_aadhaar_conflict +
+                           sheet["blank_rows"] + sheet_failed)
+        reconcile_status = "PASS" if parsed_rows == total_accounted else "FAIL"
+
+        reconcile_msg = (
+            f"\n===================================\n"
+            f"Sheet : {sheet_name}\n"
+            f"Excel Rows          : {sheet.get('total_rows', parsed_rows)}\n"
+            f"Parsed Rows         : {parsed_rows}\n"
+            f"Inserted            : {sheet_inserted}\n"
+            f"Updated             : {sheet_updated}\n"
+            f"Incomplete          : {sheet_incomplete}\n"
+            f"Duplicate Updated   : {sheet_duplicate_updated}\n"
+            f"Missing Ticket (ID) : {sheet_identity_conflict}\n"
+            f"Aadhaar Conflicts   : {sheet_aadhaar_conflict}\n"
+            f"Blank Rows          : {sheet['blank_rows']}\n"
+            f"Failed Rows         : {sheet_failed}\n"
+            f"--------------------------------\n"
+            f"TOTAL ACCOUNTED\n"
+            f"Expected            : {parsed_rows}\n"
+            f"Actual              : {total_accounted}\n"
+            f"PASS / FAIL         : {reconcile_status}\n"
+            f"===================================\n"
+        )
+        print(reconcile_msg)
+        logger.info(reconcile_msg)
+
+        # Audit logging
         AuditLogRepository.add_log(
             db=db,
             action="IMPORT_BDC_SHEET",
             module="BDC_UPLOAD",
-            details=f"Workbook: {file_name} | Sheet: {sheet_name} | Import Time: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} | Rows Read: {sheet['valid_rows'] + sheet['blank_rows']} | Rows Imported: {sheet_inserted} | Rows Updated: {sheet_updated} | Rows Failed: {sheet_failed} | Operator: Admin | Duration: {sheet_duration:.2f}s",
+            details=f"Workbook: {file_name} | Sheet: {sheet_name} | Reconcile: {reconcile_status} (Parsed: {parsed_rows}, Accounted: {total_accounted})",
             operator="Admin",
             workbook=file_name,
             sheet=sheet_name,
-            rows_count=sheet['valid_rows'] + sheet['blank_rows'],
+            rows_count=parsed_rows,
             duration=sheet_duration,
-            inserted=sheet_inserted,
-            updated=sheet_updated,
+            inserted=sheet_inserted + sheet_incomplete_inserted,
+            updated=sheet_updated + sheet_duplicate_updated + sheet_incomplete_updated,
             failed=sheet_failed,
-            warnings=len(state["warnings"]),
+            warnings=sheet_incomplete + sheet_identity_conflict,
             errors=sheet_failed,
             before_state={"trainees": sheet_before_state} if sheet_before_state else None,
             after_state={"trainees": sheet_after_state} if sheet_after_state else None,
@@ -649,55 +742,38 @@ class ImportService:
             commit=False
         )
 
-        # Detailed parser debug log
-        import logging
-        logger = logging.getLogger("workbook_parser")
-        class_info = WorkbookParser._CLASSIFICATION_REASONS.get(sheet_name, {})
-        classification_score = class_info.get("score_summary", "N/A")
-        sheet_type = sheet.get("sheet_type", "Employee Master")
-        
-        debug_msg = (
-            f"\n=== DETAILED PARSER DEBUG LOG ===\n"
-            f"Workbook Name       : {file_name}\n"
-            f"Sheet Name          : {sheet_name}\n"
-            f"Detected Headers    : {sheet.get('original_headers', [])}\n"
-            f"Classification Score: {classification_score}\n"
-            f"Final Sheet Type    : {sheet_type}\n"
-            f"Processing Route    : Employee Master Ingestion\n"
-            f"Rows Imported       : {sheet_inserted}\n"
-            f"Rows Updated        : {sheet_updated}\n"
-            f"Rows Failed         : {sheet_failed}\n"
-            f"Warnings            : {state.get('warnings', [])}\n"
-            f"Errors              : {state.get('errors', [])}\n"
-            f"================================="
-        )
-        logger.info(debug_msg)
-        print(debug_msg)
-
-        # Record sheet summary
-        sheet_errors_count = sum(1 for e in state["errors"] if e.startswith(f"Sheet '{sheet_name}'"))
-        sheet_warnings_count = sum(1 for w in state["warnings"] if w.startswith(f"Sheet '{sheet_name}'"))
-        if "sheet_summaries" not in state:
-            state["sheet_summaries"] = {}
         state["sheet_summaries"][sheet_name] = {
             "sheet_name": sheet_name,
             "sheet_type": "Employee Master",
             "scheme": sheet_scheme,
-            "rows_read": len(sheet["rows"]),
-            "inserted": sheet_inserted,
-            "updated": sheet_updated,
-            "skipped": max(0, len(sheet["rows"]) - sheet_inserted - sheet_updated - sheet_failed),
-            "warnings": sheet_warnings_count,
-            "errors": sheet_errors_count
+            "rows_read": parsed_rows,
+            "inserted": sheet_inserted + sheet_incomplete_inserted,
+            "updated": sheet_updated + sheet_duplicate_updated + sheet_incomplete_updated,
+            "skipped": sheet_blank + sheet_identity_conflict,
+            "aadhaar_conflicts": sheet_aadhaar_conflict,
+            "warnings": sheet_incomplete + sheet_identity_conflict + sheet_aadhaar_conflict,
+            "errors": sheet_failed
         }
 
     @classmethod
     def _process_separation_sheet(cls, db: Session, sheet: Dict[str, Any], file_name: str, BATCH_SIZE: int, state: Dict[str, Any]) -> None:
         import time
+        import uuid
+        import logging
+        import datetime
+        logger = logging.getLogger("workbook_parser")
+        
         sheet_name = sheet["sheet_name"]
+        sheet_inserted = 0
+        sheet_updated = 0
+        sheet_incomplete = 0
+        sheet_duplicate_updated = 0
+        sheet_identity_conflict = 0
+        sheet_blank = 0
+        sheet_failed = 0
         sheet_separated = 0
         sheet_blocked = 0
-        sheet_failed = 0
+        
         sheet_start_time = time.time()
         sheet_before_state = {}
         sheet_after_state = {}
@@ -705,52 +781,50 @@ class ImportService:
         sheet_month = cls._parse_sheet_month(sheet_name)
         seen_row_trainees = set()
 
-        def process_batch(rows_to_process):
-            nonlocal sheet_separated, sheet_blocked, sheet_failed
-            valid_rows = []
-            batch_trainee_ids = set()
+        first_row = sheet["rows"][0] if sheet["rows"] else {}
+        _, sheet_scheme = cls.derive_category_and_scheme(sheet_name, first_row, file_name)
 
+        def process_batch(rows_to_process):
+            nonlocal sheet_inserted, sheet_updated, sheet_incomplete, sheet_duplicate_updated, sheet_identity_conflict, sheet_blank, sheet_failed, sheet_separated, sheet_blocked
+            
+            batch_trainee_ids = set()
+            cleaned_rows = []
+            
             for row in rows_to_process:
                 row_num = row["_row_num"]
                 state["rows_processed"] += 1
-                try:
-                    # Get standard key values
-                    trainee_id = row.get("trainee_id") or row.get("ticket_number") or ""
-                    dol = row.get("end_date")
-                    reason = str(row.get("reason") or "").strip() or "Separated"
+                
+                # Ignore blank rows: if all keys except '_row_num' are blank/None/empty
+                is_blank = True
+                for k, v in row.items():
+                    if k != "_row_num" and v is not None and str(v).strip() != "":
+                        is_blank = False
+                        break
+                if is_blank:
+                    sheet_blank += 1
+                    continue
 
-                    if not trainee_id or not dol:
-                        state["skipped_count"] += 1
-                        state["error_count"] += 1
-                        sheet_failed += 1
-                        state["errors"].append(f"Sheet '{sheet_name}', Row {row_num}: Missing Trainee ID or Date of Leaving.")
-                        continue
+                trainee_id = row.get("trainee_id") or row.get("ticket_number") or ""
+                trainee_id = str(trainee_id).strip()
+                if trainee_id.lower() == 'nan': trainee_id = ""
+                
+                dol = row.get("end_date")
+                reason = str(row.get("reason") or "").strip() or "Separated"
+                if reason.lower() == 'nan': reason = "Separated"
 
-                    if (trainee_id, dol) in seen_row_trainees:
-                        state["skipped_count"] += 1
-                        state["duplicate_count"] += 1
-                        state["error_count"] += 1
-                        sheet_failed += 1
-                        state["errors"].append(f"Sheet '{sheet_name}', Row {row_num}: Duplicate separation entry for '{trainee_id}' on {dol} within the sheet.")
-                        continue
-                    seen_row_trainees.add((trainee_id, dol))
-
+                cleaned_rows.append({
+                    "row_num": row_num,
+                    "id": trainee_id,
+                    "dol": dol,
+                    "reason": reason
+                })
+                if trainee_id:
                     batch_trainee_ids.add(trainee_id)
-                    valid_rows.append({
-                        "row_num": row_num,
-                        "id": trainee_id,
-                        "dol": dol,
-                        "reason": reason
-                    })
-                except Exception as e:
-                    state["skipped_count"] += 1
-                    state["error_count"] += 1
-                    sheet_failed += 1
-                    state["errors"].append(f"Sheet '{sheet_name}', Row {row_num}: Error parsing columns: {str(e)}")
 
-            if not valid_rows:
+            if not cleaned_rows:
                 return
 
+            # Lookup existing trainees
             existing_trainees = {
                 t.id: t for t in db.query(Trainee).filter(Trainee.id.in_(batch_trainee_ids)).all()
             }
@@ -761,124 +835,81 @@ class ImportService:
                     existing_trainees[t.ticket_number] = t
                     existing_trainees[t.id] = t
 
-            for item in valid_rows:
+            for item in cleaned_rows:
                 row_num = item["row_num"]
                 try:
                     trainee_id = item["id"]
                     dol = item["dol"]
                     reason = item["reason"]
 
-                    if trainee_id in existing_trainees:
-                        trainee = existing_trainees[trainee_id]
-                        
-                        # Newer separation check
+                    # 1. Missing Identity Check: DO NOT insert a fake employee if identity is missing
+                    if not trainee_id:
+                        sheet_identity_conflict += 1
+                        state["skip_count"] += 1
+                        print(f"Sheet : {sheet_name} | Excel Row : {row_num} | Ticket : MISSING | Identity Incomplete | Status : IDENTITY_INCOMPLETE")
+                        logger.warning(f"Sheet : {sheet_name} | Excel Row : {row_num} | Ticket : MISSING | Identity Incomplete | Status : IDENTITY_INCOMPLETE")
+                        continue
+
+                    # 2. Duplicate Sheet Ingestion Check
+                    if (trainee_id, dol) in seen_row_trainees:
+                        sheet_duplicate_updated += 1
+                        state["skip_count"] += 1
+                        print("Duplicate Ticket")
+                        print("Existing Updated")
+                        logger.warning(f"Duplicate separation entry within sheet: Row {row_num}")
+                        continue
+                    seen_row_trainees.add((trainee_id, dol))
+
+                    missing_fields = []
+                    if not dol:
+                        dol = None
+                        missing_fields.append("DOL")
+
+                    # 3. Trainee Resolution / Create if missing
+                    trainee = existing_trainees.get(trainee_id)
+                    is_new = False
+                    if not trainee:
+                        # Create trainee as INCOMPLETE/SEPARATED
+                        is_new = True
+                        validation_metadata = {
+                            "validation_status": "INCOMPLETE",
+                            "missing_fields": ["Name", "DOJ"] + missing_fields
+                        }
+                        trainee = Trainee(
+                            id=trainee_id,
+                            name="MISSING",
+                            doj=None,
+                            dol=dol,
+                            scheme=sheet_scheme,
+                            status="SEPARATED",
+                            ticket_number=trainee_id if trainee_id.isdigit() else None,
+                            extra_data={"validation_metadata": validation_metadata}
+                        )
+                        db.add(trainee)
+                        db.flush()
+                        existing_trainees[trainee_id] = trainee
+                        existing_trainees[trainee.ticket_number] = trainee
+                        sheet_incomplete += 1
+                        state["created_count"] += 1
+                    else:
+                        # Existing trainee: newer separation check
                         if trainee.dol:
-                            if dol == trainee.dol or dol < trainee.dol:
+                            if dol == trainee.dol or (dol and dol < trainee.dol):
+                                sheet_duplicate_updated += 1
                                 state["skip_count"] += 1
                                 continue
-                            else: # dol > trainee.dol
-                                prev_doj = trainee.doj
-                                prev_invoices = []
-                                prev_ledger = []
-                                prev_validations = []
-                                old_reason = "Separated"
-
-                                if prev_doj:
-                                    invs = db.query(InvoiceRecord).filter(
-                                        InvoiceRecord.trainee_id == trainee.id,
-                                        InvoiceRecord.invoice_date >= prev_doj
-                                    ).all()
-                                    prev_invoices = [
-                                        {
-                                            "invoice_number": inv.invoice_number,
-                                            "invoice_date": inv.invoice_date.strftime("%Y-%m-%d") if inv.invoice_date else None,
-                                            "billed_joining_amount": inv.billed_joining_amount,
-                                            "billed_180_days_amount": inv.billed_180_days_amount,
-                                            "billed_other_amount": inv.billed_other_amount,
-                                            "billed_total_amount": inv.billed_total_amount,
-                                            "approved_joining_amount": inv.approved_joining_amount,
-                                            "approved_180_days_amount": inv.approved_180_days_amount,
-                                            "approved_total_amount": inv.approved_total_amount,
-                                            "status": inv.status,
-                                            "file_name": inv.file_name
-                                        }
-                                        for inv in invs
-                                    ]
-
-                                    leds = db.query(PaymentLedger).filter(
-                                        PaymentLedger.trainee_id == trainee.id,
-                                        PaymentLedger.payment_date >= prev_doj
-                                    ).all()
-                                    prev_ledger = [
-                                        {
-                                            "invoice_number": led.invoice_number,
-                                            "payment_type": led.payment_type,
-                                            "amount_paid": led.amount_paid,
-                                            "payment_date": led.payment_date.strftime("%Y-%m-%d") if led.payment_date else None
-                                        }
-                                        for led in leds
-                                    ]
-
-                                    vals = db.query(ValidationResult).filter(
-                                        ValidationResult.trainee_id == trainee.id,
-                                        ValidationResult.created_at >= datetime.datetime(prev_doj.year, prev_doj.month, prev_doj.day)
-                                    ).all()
-                                    prev_validations = [
-                                        {
-                                            "rule_name": val.rule_name,
-                                            "status": val.status,
-                                            "message": val.message,
-                                            "reason_code": val.reason_code,
-                                            "recommended_action": val.recommended_action
-                                        }
-                                        for val in vals
-                                    ]
-
-                                    if trainee.status == "BLOCKED":
-                                        old_reason = trainee.blocked_reason or "Blocked"
-                                    elif trainee.status == "SEPARATED":
-                                        latest_sep = db.query(SeparationRecord).filter(
-                                            SeparationRecord.trainee_id == trainee.id
-                                        ).order_by(SeparationRecord.dol.desc()).first()
-                                        if latest_sep:
-                                            old_reason = latest_sep.reason or "Separated"
-
-                                old_lc = TraineeLifecycle(
-                                    trainee_id=trainee.id,
-                                    joining_date=trainee.doj,
-                                    leaving_date=trainee.dol,
-                                    status=trainee.status,
-                                    upload_id=state.get("upload_id"),
-                                    extra_data={
-                                        "invoice_history": prev_invoices,
-                                        "payment_ledger": prev_ledger,
-                                        "validation_history": prev_validations,
-                                        "reason": old_reason,
-                                        "category": trainee.category,
-                                        "batch": trainee.batch,
-                                        "shop": trainee.shop,
-                                        "bdc_workbook": trainee.current_workbook,
-                                        "bdc_sheet": trainee.current_sheet
-                                    }
-                                )
-                                db.add(old_lc)
-                                db.flush()
 
                         if trainee.id not in sheet_before_state:
                             sheet_before_state[trainee.id] = cls._serialize_trainee_state(trainee)
 
-                        if not trainee.doj:
-                            raise ValueError(f"Trainee '{trainee_id}' in Database does not have a Date of Joining. Cannot calculate tenure.")
+                    # 4. Process separation logic without raising errors for null DOJ
+                    days_worked = None
+                    status_after = "SEPARATED"
+                    blocked_reason = None
 
+                    if trainee.doj and dol:
                         days_worked = (dol - trainee.doj).days
-                        if days_worked < 0:
-                            raise ValueError(f"Date of Leaving ({dol}) is before Date of Joining ({trainee.doj}).")
-
-                        status_before = trainee.status
-                        status_after = "SEPARATED"
-                        blocked_reason = None
-
-                        if days_worked < 30:
+                        if days_worked >= 0 and days_worked < 30:
                             status_after = "BLOCKED"
                             blocked_reason = f"Early Separation - Resigned before 30 days (tenure: {days_worked} days)"
                             reason = "Early Separation"
@@ -888,50 +919,85 @@ class ImportService:
                         else:
                             sheet_separated += 1
                             state["separated_count"] += 1
-
-                        existing_rec = db.query(SeparationRecord).filter(
-                            SeparationRecord.trainee_id == trainee.id,
-                            SeparationRecord.dol == dol
-                        ).first()
-
-                        if not existing_rec:
-                            sep_rec = SeparationRecord(
-                                trainee_id=trainee.id,
-                                dol=dol,
-                                reason=reason,
-                                file_name=file_name,
-                                extra_data={
-                                    "sheet": sheet_name,
-                                    "sheet_name": sheet_name,
-                                    "month": sheet_month,
-                                    "status_before": status_before,
-                                    "status_after": status_after,
-                                    "tenure": days_worked,
-                                    "early_exit": days_worked < 30,
-                                    "days_worked": days_worked,
-                                    "scheme": trainee.scheme
-                                }
-                            )
-                            db.add(sep_rec)
-                        else:
-                            state["skip_count"] += 1
-
-                        trainee.dol = dol
-                        trainee.status = status_after
-                        trainee.blocked_reason = blocked_reason
-                        sheet_after_state[trainee.id] = cls._serialize_trainee_state(trainee)
-                        
-                        state["success_count"] += 1
                     else:
-                        state["skipped_count"] += 1
-                        state["unknown_employees_count"] += 1
-                        state["error_count"] += 1
-                        sheet_failed += 1
-                        state["errors"].append(f"Sheet '{sheet_name}', Row {row_num}: Trainee ID '{trainee_id}' not found in Employee Master. Please import BDC Master first.")
+                        sheet_separated += 1
+                        state["separated_count"] += 1
+
+                    # Log incomplete rows as WARNING
+                    all_missing = missing_fields.copy()
+                    if trainee.name == "MISSING":
+                        all_missing.append("Name")
+                    if trainee.doj is None:
+                        all_missing.append("DOJ")
+                    
+                    if all_missing:
+                        missing_str = ", ".join(all_missing)
+                        print(f"Sheet : {sheet_name} | Excel Row : {row_num} | Ticket : {trainee.ticket_number or trainee_id} | Imported | Status : INCOMPLETE | Missing: {missing_str}")
+                        logger.warning(f"Sheet : {sheet_name} | Excel Row : {row_num} | Ticket : {trainee.ticket_number or trainee_id} | Imported | Status : INCOMPLETE | Missing: {missing_str}")
+
+                    # Update reconciliation stats for first-time sheet updates
+                    if not is_new:
+                        if all_missing:
+                            sheet_incomplete += 1
+                        else:
+                            sheet_updated += 1
+
+                    # Save separation record
+                    existing_rec = db.query(SeparationRecord).filter(
+                        SeparationRecord.trainee_id == trainee.id,
+                        SeparationRecord.dol == dol
+                    ).first()
+
+                    if not existing_rec:
+                        sep_rec = SeparationRecord(
+                            trainee_id=trainee.id,
+                            dol=dol,
+                            reason=reason,
+                            file_name=file_name,
+                            extra_data={
+                                "sheet": sheet_name,
+                                "sheet_name": sheet_name,
+                                "month": sheet_month,
+                                "status_before": trainee.status,
+                                "status_after": status_after,
+                                "tenure": days_worked,
+                                "early_exit": days_worked is not None and days_worked < 30,
+                                "days_worked": days_worked,
+                                "scheme": trainee.scheme
+                            }
+                        )
+                        db.add(sep_rec)
+
+                        # Write a TraineeLifecycle record to preserve history
+                        sep_lc = TraineeLifecycle(
+                            trainee_id=trainee.id,
+                            joining_date=trainee.doj,
+                            leaving_date=dol,
+                            status=status_after,
+                            upload_id=state.get("upload_id"),
+                            extra_data={
+                                "reason": reason,
+                                "days_worked": days_worked,
+                                "early_exit": days_worked is not None and days_worked < 30,
+                                "sheet": sheet_name,
+                                "month": sheet_month,
+                                "scheme": trainee.scheme,
+                                "category": trainee.category,
+                            }
+                        )
+                        db.add(sep_lc)
+
+                    trainee.dol = dol
+                    trainee.status = status_after
+                    trainee.blocked_reason = blocked_reason
+                    
+                    sheet_after_state[trainee.id] = cls._serialize_trainee_state(trainee)
+                    state["success_count"] += 1
                 except Exception as e:
-                    state["skipped_count"] += 1
-                    state["error_count"] += 1
+                    import traceback
+                    traceback.print_exc()
                     sheet_failed += 1
+                    state["error_count"] += 1
                     state["errors"].append(f"Sheet '{sheet_name}', Row {row_num}: Database operation failed: {str(e)}")
 
             db.flush()
@@ -941,20 +1007,50 @@ class ImportService:
             process_batch(sheet["rows"][i:i+BATCH_SIZE])
 
         sheet_duration = time.time() - sheet_start_time
+
+        parsed_rows = len(sheet["rows"]) + sheet["blank_rows"]
+        total_accounted = (sheet_inserted + sheet_updated + sheet_incomplete + 
+                           sheet_duplicate_updated + sheet_identity_conflict + 
+                           sheet["blank_rows"] + sheet_failed)
+        reconcile_status = "PASS" if parsed_rows == total_accounted else "FAIL"
+
+        reconcile_msg = (
+            f"\n===================================\n"
+            f"Sheet : {sheet_name}\n"
+            f"Excel Rows          : {sheet.get('total_rows', parsed_rows)}\n"
+            f"Parsed Rows         : {parsed_rows}\n"
+            f"Inserted            : {sheet_inserted}\n"
+            f"Updated             : {sheet_updated}\n"
+            f"Incomplete          : {sheet_incomplete}\n"
+            f"Duplicate Updated   : {sheet_duplicate_updated}\n"
+            f"Identity Conflicts  : {sheet_identity_conflict}\n"
+            f"Blank Rows          : {sheet['blank_rows']}\n"
+            f"Failed Rows         : {sheet_failed}\n"
+            f"--------------------------------\n"
+            f"TOTAL ACCOUNTED\n"
+            f"Expected            : {parsed_rows}\n"
+            f"Actual              : {total_accounted}\n"
+            f"PASS / FAIL         : {reconcile_status}\n"
+            f"===================================\n"
+        )
+        print(reconcile_msg)
+        logger.info(reconcile_msg)
+
+        # Audit logging
         AuditLogRepository.add_log(
             db=db,
             action="IMPORT_SEPARATION_SHEET",
             module="SEPARATION_UPLOAD",
-            details=f"Workbook: {file_name} | Sheet: {sheet_name} | Import Time: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} | Rows Read: {sheet['valid_rows'] + sheet['blank_rows']} | Rows Imported: {sheet_separated + sheet_blocked} | Rows Updated: {sheet_separated + sheet_blocked} | Rows Failed: {sheet_failed} | Operator: Admin | Duration: {sheet_duration:.2f}s",
+            details=f"Workbook: {file_name} | Sheet: {sheet_name} | Reconcile: {reconcile_status} (Parsed: {parsed_rows}, Accounted: {total_accounted})",
             operator="Admin",
             workbook=file_name,
             sheet=sheet_name,
-            rows_count=sheet['valid_rows'] + sheet['blank_rows'],
+            rows_count=parsed_rows,
             duration=sheet_duration,
-            inserted=0,
-            updated=sheet_separated + sheet_blocked,
+            inserted=sheet_inserted + sheet_incomplete,
+            updated=sheet_updated + sheet_duplicate_updated,
             failed=sheet_failed,
-            warnings=len(state["warnings"]),
+            warnings=sheet_incomplete + sheet_identity_conflict,
             errors=sheet_failed,
             before_state={"trainees": sheet_before_state} if sheet_before_state else None,
             after_state={"trainees": sheet_after_state} if sheet_after_state else None,
@@ -962,51 +1058,16 @@ class ImportService:
             commit=False
         )
 
-        # Detailed parser debug log
-        import logging
-        logger = logging.getLogger("workbook_parser")
-        class_info = WorkbookParser._CLASSIFICATION_REASONS.get(sheet_name, {})
-        classification_score = class_info.get("score_summary", "N/A")
-        sheet_type = sheet.get("sheet_type", "Separation")
-        
-        debug_msg = (
-            f"\n=== DETAILED PARSER DEBUG LOG ===\n"
-            f"Workbook Name       : {file_name}\n"
-            f"Sheet Name          : {sheet_name}\n"
-            f"Detected Headers    : {sheet.get('original_headers', [])}\n"
-            f"Classification Score: {classification_score}\n"
-            f"Final Sheet Type    : {sheet_type}\n"
-            f"Processing Route    : Separation Ingestion\n"
-            f"Rows Imported       : 0\n"
-            f"Rows Updated        : {sheet_separated + sheet_blocked}\n"
-            f"Rows Failed         : {sheet_failed}\n"
-            f"Warnings            : {state.get('warnings', [])}\n"
-            f"Errors              : {state.get('errors', [])}\n"
-            f"================================="
-        )
-        logger.info(debug_msg)
-        print(debug_msg)
-
-        # Record sheet summary
-        sheet_errors_count = sum(1 for e in state["errors"] if e.startswith(f"Sheet '{sheet_name}'"))
-        sheet_warnings_count = sum(1 for w in state["warnings"] if w.startswith(f"Sheet '{sheet_name}'"))
-        
-        # Derive scheme from sheet
-        first_row = sheet["rows"][0] if sheet["rows"] else {}
-        _, sheet_scheme = cls.derive_category_and_scheme(sheet_name, first_row, file_name)
-        
-        if "sheet_summaries" not in state:
-            state["sheet_summaries"] = {}
         state["sheet_summaries"][sheet_name] = {
             "sheet_name": sheet_name,
             "sheet_type": "Separation",
             "scheme": sheet_scheme,
-            "rows_read": len(sheet["rows"]),
-            "inserted": 0,
-            "updated": sheet_separated + sheet_blocked,
-            "skipped": max(0, len(sheet["rows"]) - sheet_separated - sheet_blocked - sheet_failed),
-            "warnings": sheet_warnings_count,
-            "errors": sheet_errors_count
+            "rows_read": parsed_rows,
+            "inserted": sheet_inserted,
+            "updated": sheet_updated + sheet_duplicate_updated,
+            "skipped": sheet_blank + sheet_identity_conflict,
+            "warnings": sheet_incomplete + sheet_identity_conflict,
+            "errors": sheet_failed
         }
 
     @classmethod
@@ -1234,8 +1295,7 @@ class ImportService:
         print("commit completed")
         # Print count after import
         count_after = db.query(Trainee).count()
-        print(f"Print count after import: {count_after}")
-
+        state["skipped_count"] = state["skip_count"]
         return {
             "success": True,
             "processed": state["rows_processed"],
@@ -1537,8 +1597,7 @@ class ImportService:
         print("commit completed")
         # Print count after import
         count_after = db.query(Trainee).count()
-        print(f"Print count after import: {count_after}")
-        
+        state["skipped_count"] = state["skip_count"]
         return {
             "success": True,
             "processed": state["rows_processed"],

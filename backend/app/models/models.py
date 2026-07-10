@@ -20,7 +20,7 @@ class Trainee(Base):
 
     id = Column(String, primary_key=True, index=True) # Trainee ID / Emp ID
     name = Column(String, nullable=False)
-    doj = Column(Date, nullable=False)
+    doj = Column(Date, nullable=True)
     dol = Column(Date, nullable=True)
     scheme = Column(String, nullable=False) # NAPS, B.Tech, M.Tech
     status = Column(String, default="ACTIVE", nullable=False) # ACTIVE, SEPARATED, BLOCKED, INACTIVE

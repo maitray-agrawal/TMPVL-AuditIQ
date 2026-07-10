@@ -130,7 +130,7 @@ class TestWorkbookParserEnterprise(unittest.TestCase):
 
     def test_offer_id_validation_strictness(self):
         """Verify strict offer_id checks when present, and backwards compatibility warning when absent."""
-        # 1. offer_id column exists but missing in row
+        # 1. offer_id column exists but missing in row -> stored as "MISSING", imported as incomplete
         data_missing = {
             "Master": [
                 ["Trainee ID", "Trainee Name", "Date of Joining", "Offer Letter ID"],
@@ -139,9 +139,11 @@ class TestWorkbookParserEnterprise(unittest.TestCase):
         }
         excel_missing = self._create_excel_file(data_missing)
         res_missing = ImportService.import_bdc_workbook(self.db, excel_missing, "missing_offer.xlsx")
-        self.assertEqual(res_missing["failed_records"], 1)
-        self.assertEqual(len(res_missing["errors"]), 1)
-        self.assertIn("Missing required field: offer_id", res_missing["errors"][0])
+        self.assertEqual(res_missing["inserted_records"], 1)
+        self.assertEqual(res_missing["failed_records"], 0)
+        trainee = self.db.query(Trainee).filter(Trainee.id == "T100").first()
+        self.assertIsNotNone(trainee)
+        self.assertEqual(trainee.offer_id, "MISSING")
 
         # 2. offer_id column does not exist -> Sheet warning only, record imports successfully
         data_absent = {

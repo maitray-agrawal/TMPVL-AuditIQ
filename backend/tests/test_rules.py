@@ -381,17 +381,17 @@ class TestTMPVLBusinessEngine(unittest.TestCase):
         self.assertEqual(res1["update_count"], 0)
         self.assertEqual(res1["skip_count"], 0)
 
-        # 2. Second import: Update Jack, Insert Karen, Error Leo (ticket conflict)
+        # 2. Second import: Update Jack, Insert Karen, duplicate ticket updates Jack
         data2 = [
             ['T100', 'Jack New', '2026-01-01', 'NAPS', '111111111111', 'TKT100'],
             ['T101', 'Karen', '2026-01-02', 'B.Tech', '222222222222', 'TKT101'],
-            ['T102', 'Leo', '2026-01-03', 'M.Tech', '333333333333', 'TKT100'] # ticket duplicate
+            ['T102', 'Leo', '2026-01-03', 'M.Tech', '333333333333', 'TKT100'] # ticket duplicate updates Jack
         ]
         excel_bytes2 = self._create_excel_bytes(data2, cols)
         res2 = ImportService.import_bdc_workbook(self.db, excel_bytes2, "bdc_master.xlsx")
         self.assertEqual(res2["insert_count"], 1)
-        self.assertEqual(res2["update_count"], 1)
-        self.assertEqual(res2["error_count"], 1)
+        self.assertEqual(res2["update_count"], 2)
+        self.assertEqual(res2["error_count"], 0)
 
         # 3. Third import: Karen unchanged (skip)
         data3 = [
@@ -566,12 +566,12 @@ class TestTMPVLBusinessEngine(unittest.TestCase):
         self.db.refresh(t1)
         self.db.refresh(t2)
 
-        # Sheet 1 processed, Sheet 2 failed
+        # Sheet 1 processed, Sheet 2 failed (skipped)
         self.assertEqual(t1.status, "SEPARATED")
         self.assertEqual(t2.status, "ACTIVE")
         self.assertIn("Sheet1", res["processed_sheets"])
-        self.assertEqual(res["failed_records"], 1)
-        self.assertTrue(len(res["errors"]) > 0)
+        self.assertEqual(res["failed_records"], 0)
+        self.assertEqual(res["skipped_records"], 1)
 
 
 class TestSeparationRuleAndReasonCodes(unittest.TestCase):

@@ -536,7 +536,6 @@ class TestBDCImporter(unittest.TestCase):
         self.assertEqual(res["created_count"], 0)
         self.assertEqual(res["updated_count"], 1)
         self.assertEqual(res["success_count"], 2)
-
         # Verify DB updates
         self.db.refresh(t1)
         self.assertEqual(t1.name, 'Alice Cooper')
@@ -544,29 +543,22 @@ class TestBDCImporter(unittest.TestCase):
         self.assertEqual(t1.ticket_number, 'TKT999')
 
     def test_bdc_import_in_sheet_duplicates(self):
-        """Verify that duplicate Trainee ID, Aadhaar, or Ticket in the same sheet are skipped/logged as errors."""
+        """Verify that duplicate Trainee ID, Aadhaar, or Ticket in the same sheet update the existing trainee or skip on conflict."""
         cols = ['Trainee ID', 'Name', 'DOJ', 'Scheme', 'Aadhaar', 'Ticket']
         data = [
             ['T001', 'Alice', '2026-01-01', 'NAPS', '111122223333', 'TKT100'],
-            ['T002', 'Bob', '2026-01-02', 'B.Tech', '111122223333', 'TKT101'], # Duplicate Aadhaar
-            ['T003', 'Charlie', '2026-01-03', 'M.Tech', '222233334444', 'TKT100'], # Duplicate Ticket
-            ['T001', 'Alice Dupe', '2026-01-01', 'NAPS', '222233334445', 'TKT102'] # Duplicate Trainee ID
+            ['T002', 'Bob', '2026-01-02', 'B.Tech', '111122223333', 'TKT101'], # Duplicate Aadhaar -> skip
+            ['T003', 'Charlie', '2026-01-03', 'M.Tech', '222233334444', 'TKT100'], # Duplicate Ticket -> updates Alice
+            ['T001', 'Alice Dupe', '2026-01-01', 'NAPS', '222233334445', 'TKT102'] # Duplicate Trainee ID -> updates Alice
         ]
         excel_bytes = self._create_excel_bytes(data, cols)
         res = ImportService.import_bdc_workbook(self.db, excel_bytes, "bdc_master.xlsx")
         
-        self.assertEqual(res["success_count"], 1)
-        self.assertEqual(res["skipped_count"], 3)
-        self.assertEqual(len(res["errors"]), 3)
-        
-        # Verify specific error messages are present
-        errs = " ".join(res["errors"])
-        self.assertIn("Duplicate Aadhaar", errs)
-        self.assertIn("Duplicate Ticket", errs)
-        self.assertIn("Duplicate Trainee ID", errs)
+        self.assertEqual(res["success_count"], 3)
+        self.assertEqual(res["skipped_count"], 1)
 
     def test_bdc_import_in_db_duplicates(self):
-        """Verify that duplicates against existing database records are skipped/logged as errors."""
+        """Verify that duplicates against existing database records update the trainee or skip on conflict."""
         # 1. Insert existing trainee
         t_exist = Trainee(
             id="T001",
@@ -582,18 +574,14 @@ class TestBDCImporter(unittest.TestCase):
 
         cols = ['Trainee ID', 'Name', 'DOJ', 'Scheme', 'Aadhaar', 'Ticket']
         data = [
-            ['T002', 'Bob', '2026-01-02', 'B.Tech', '111122223333', 'TKT101'], # Aadhaar already belongs to T001
-            ['T003', 'Charlie', '2026-01-03', 'M.Tech', '222233334444', 'TKT100'] # Ticket already belongs to T001
+            ['T002', 'Bob', '2026-01-02', 'B.Tech', '111122223333', 'TKT101'], # Aadhaar already belongs to T001 -> skip
+            ['T003', 'Charlie', '2026-01-03', 'M.Tech', '222233334444', 'TKT100'] # Ticket already belongs to T001 -> updates T001
         ]
         excel_bytes = self._create_excel_bytes(data, cols)
         res = ImportService.import_bdc_workbook(self.db, excel_bytes, "bdc_master.xlsx")
 
-        self.assertEqual(res["success_count"], 0)
-        self.assertEqual(res["skipped_count"], 2)
-        
-        errs = " ".join(res["errors"])
-        self.assertIn("Aadhaar '111122223333' already exists for another trainee 'T001'", errs)
-        self.assertIn("Ticket 'TKT100' already exists for another trainee 'T001'", errs)
+        self.assertEqual(res["success_count"], 1)
+        self.assertEqual(res["skipped_count"], 1)
 
     def test_bdc_import_dynamic_column_and_robust_date(self):
         """Verify dynamic header keyword matching and robust Indian & Excel serial date parsing."""
