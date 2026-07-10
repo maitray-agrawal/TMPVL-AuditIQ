@@ -526,7 +526,7 @@ def unblock_trainee(trainee_id: str, db: Session = Depends(get_db)):
 @router.post("/uploads/bdc")
 async def upload_bdc(
     file: UploadFile = File(...),
-    upload_mode: str = Form("INCREMENTAL"),
+    upload_mode: str = Form("MASTER"),
     admin: str = Depends(get_offline_user),
     db: Session = Depends(get_db)
 ):
@@ -543,12 +543,13 @@ async def upload_bdc(
 @router.post("/uploads/separation")
 async def upload_separation(
     file: UploadFile = File(...),
+    upload_mode: str = Form("MASTER"),
     admin: str = Depends(get_offline_user),
     db: Session = Depends(get_db)
 ):
     content, filename = await _read_upload_safely(file)
     try:
-        return ImportService.import_separation_workbook(db, content, filename, operator=admin)
+        return ImportService.import_separation_workbook(db, content, filename, upload_mode=upload_mode, operator=admin)
     except HTTPException:
         raise
     except Exception as exc:

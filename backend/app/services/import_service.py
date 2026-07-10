@@ -74,37 +74,60 @@ class ImportService:
         return name
 
     @classmethod
-    def derive_category_and_scheme(cls, sheet_name: str, row_dict: Dict[str, Any]) -> Tuple[str, str]:
-        # Try to find category from row dictionary using synonyms
-        raw_cat = cls.get_column_value(row_dict, WorkbookParser.SYNONYMS["category"])
-        if raw_cat:
-            cat = str(raw_cat).strip().upper()
-        else:
-            # Fallback to sheet name
-            cat = sheet_name.strip().upper()
-        
-        # Strip trailing/leading separation markers from sheet name category if present
-        # e.g. "NAPS SEPARATION" -> category "NAPS"
-        cat = re.sub(r'[\-_]?SEPARATION\b', '', cat).strip()
-        
-        # Normalize category name
-        if "B.TECH" in cat or "BTECH" in cat:
-            normalized_cat = "B.TECH"
-            scheme = "B.Tech"
-        elif "M.TECH" in cat or "MTECH" in cat:
-            normalized_cat = "M.TECH"
-            scheme = "M.Tech"
-        elif "NAPS" in cat:
-            normalized_cat = "NAPS"
-            scheme = "NAPS"
-        else:
-            normalized_cat = cat
-            if cat in ("ITI", "NAPS"):
-                scheme = cat
+    def derive_category_and_scheme(cls, sheet_name: str, row_dict: Dict[str, Any], file_name: str = "") -> Tuple[str, str]:
+        # Helper to normalize category and scheme names
+        def normalize_res(val_str: str) -> Optional[Tuple[str, str]]:
+            val_clean = str(val_str).strip().upper()
+            # Remove separation or master keywords to get clean category name
+            val_clean = re.sub(r'[\-_]?(SEPARATION|MASTER|SHEET|BDC|EMPLOYEE|RECORDS|DATA|UPLOAD|SYNC)\b', '', val_clean).strip()
+            if not val_clean or re.match(r'^(SHEET|PAGE|BOOK|EXCEL|UNKNOWN|TRAINEE|TRAINEES|EMPLOYEE|EMPLOYEES|MASTER|SEPARATION|SEPARATIONS|BDC|DATA)\d*$', val_clean):
+                return None
+            
+            # Map standard schemes
+            if "B.TECH" in val_clean or "BTECH" in val_clean:
+                return "B.TECH", "B.Tech"
+            elif "M.TECH" in val_clean or "MTECH" in val_clean:
+                return "M.TECH", "M.Tech"
+            elif "NAPS" in val_clean:
+                return "NAPS", "NAPS"
+            elif "NATS" in val_clean:
+                return "NATS", "NATS"
+            elif "ITI" in val_clean:
+                return "ITI", "ITI"
             else:
-                scheme = cat.title()
-                
-        return normalized_cat, scheme
+                # Return uppercase category and Title Case scheme
+                return val_clean, val_clean.title()
+
+        # Priority 1: Sheet Name
+        sheet_res = normalize_res(sheet_name)
+        if sheet_res:
+            return sheet_res
+
+        # Priority 2: Category Column
+        category_syns = ["category", "traineecategory", "empcategory", "employeecategory"]
+        raw_cat = cls.get_column_value(row_dict, category_syns)
+        if raw_cat:
+            cat_res = normalize_res(str(raw_cat))
+            if cat_res:
+                return cat_res
+
+        # Priority 3: Program Type / Scheme Column
+        program_syns = ["scheme", "program", "course", "type", "schemetype", "programtype", "program/scheme"]
+        raw_prog = cls.get_column_value(row_dict, program_syns)
+        if raw_prog:
+            prog_res = normalize_res(str(raw_prog))
+            if prog_res:
+                return prog_res
+
+        # Priority 4: Workbook metadata (file name)
+        if file_name:
+            base_name = file_name.rsplit('.', 1)[0]
+            file_res = normalize_res(base_name)
+            if file_res:
+                return file_res
+
+        # Priority 5: Unknown
+        return "UNKNOWN", "Unknown"
 
     @classmethod
     def _process_employee_master_sheet(cls, db: Session, sheet: Dict[str, Any], file_name: str, BATCH_SIZE: int, state: Dict[str, Any]) -> None:
@@ -119,7 +142,7 @@ class ImportService:
 
         # 1. Automatic category and scheme detection
         first_row = sheet["rows"][0] if sheet["rows"] else {}
-        sheet_category, sheet_scheme = cls.derive_category_and_scheme(sheet_name, first_row)
+        sheet_category, sheet_scheme = cls.derive_category_and_scheme(sheet_name, first_row, file_name)
 
         # Check if offer_id column is present in sheet headers (original or normalized)
         has_offer_id_col = False
@@ -157,7 +180,7 @@ class ImportService:
                     r_mobile = row.get("mobile") or ""
                     r_email = row.get("email") or ""
                     
-                    r_category, r_scheme = cls.derive_category_and_scheme(sheet_name, row)
+                    r_category, r_scheme = cls.derive_category_and_scheme(sheet_name, row, file_name)
                     
                     # Clean fields
                     r_name = str(r_name).strip()
@@ -651,6 +674,23 @@ class ImportService:
         logger.info(debug_msg)
         print(debug_msg)
 
+        # Record sheet summary
+        sheet_errors_count = sum(1 for e in state["errors"] if e.startswith(f"Sheet '{sheet_name}'"))
+        sheet_warnings_count = sum(1 for w in state["warnings"] if w.startswith(f"Sheet '{sheet_name}'"))
+        if "sheet_summaries" not in state:
+            state["sheet_summaries"] = {}
+        state["sheet_summaries"][sheet_name] = {
+            "sheet_name": sheet_name,
+            "sheet_type": "Employee Master",
+            "scheme": sheet_scheme,
+            "rows_read": len(sheet["rows"]),
+            "inserted": sheet_inserted,
+            "updated": sheet_updated,
+            "skipped": max(0, len(sheet["rows"]) - sheet_inserted - sheet_updated - sheet_failed),
+            "warnings": sheet_warnings_count,
+            "errors": sheet_errors_count
+        }
+
     @classmethod
     def _process_separation_sheet(cls, db: Session, sheet: Dict[str, Any], file_name: str, BATCH_SIZE: int, state: Dict[str, Any]) -> None:
         import time
@@ -947,6 +987,28 @@ class ImportService:
         logger.info(debug_msg)
         print(debug_msg)
 
+        # Record sheet summary
+        sheet_errors_count = sum(1 for e in state["errors"] if e.startswith(f"Sheet '{sheet_name}'"))
+        sheet_warnings_count = sum(1 for w in state["warnings"] if w.startswith(f"Sheet '{sheet_name}'"))
+        
+        # Derive scheme from sheet
+        first_row = sheet["rows"][0] if sheet["rows"] else {}
+        _, sheet_scheme = cls.derive_category_and_scheme(sheet_name, first_row, file_name)
+        
+        if "sheet_summaries" not in state:
+            state["sheet_summaries"] = {}
+        state["sheet_summaries"][sheet_name] = {
+            "sheet_name": sheet_name,
+            "sheet_type": "Separation",
+            "scheme": sheet_scheme,
+            "rows_read": len(sheet["rows"]),
+            "inserted": 0,
+            "updated": sheet_separated + sheet_blocked,
+            "skipped": max(0, len(sheet["rows"]) - sheet_separated - sheet_blocked - sheet_failed),
+            "warnings": sheet_warnings_count,
+            "errors": sheet_errors_count
+        }
+
     @classmethod
     def import_bdc_workbook(cls, db: Session, file_content: bytes, file_name: str, upload_mode: str = "INCREMENTAL", operator: str = "Admin") -> Dict[str, Any]:
         """Processes the BDC Master Workbook using Universal WorkbookParser."""
@@ -1012,8 +1074,21 @@ class ImportService:
             "warnings": warnings,
             "errors": errors,
             "upload_id": current_upload_id,
-            "processed_ids": set()
+            "processed_ids": set(),
+            "sheet_summaries": {}
         }
+
+        # Resolve upload_mode scheme scope
+        upload_mode_upper = upload_mode.upper()
+        is_legacy = upload_mode_upper in ("INCREMENTAL", "FULL_SYNC")
+        expected_scheme = None
+        if not is_legacy and upload_mode_upper != "MASTER":
+            if upload_mode_upper == "BTECH":
+                expected_scheme = "B.Tech"
+            elif upload_mode_upper == "MTECH":
+                expected_scheme = "M.Tech"
+            else:
+                expected_scheme = upload_mode.title() if len(upload_mode) > 4 else upload_mode.upper()
 
         sheets_processed = []
         employee_sheets = []
@@ -1026,6 +1101,20 @@ class ImportService:
         for sheet in parsed_wb["sheets"]:
             sheet_name = sheet["sheet_name"]
             sheet_type = sheet["sheet_type"]
+            
+            # Derive sheet scheme
+            first_row = sheet["rows"][0] if sheet["rows"] else {}
+            _, sheet_scheme = cls.derive_category_and_scheme(sheet_name, first_row, file_name)
+            
+            # If individual scheme mode selected, validate & warn
+            if expected_scheme and sheet_type in ("Employee Master", "BDC", "Separation"):
+                if sheet_scheme.upper().replace(".", "") != expected_scheme.upper().replace(".", ""):
+                    skipped_sheets.append(sheet_name)
+                    state["warnings"].append(
+                        f"Workbook contains sheet '{sheet_name}' which appears to belong to scheme '{sheet_scheme}', "
+                        f"but '{expected_scheme}' was selected. This sheet was skipped."
+                    )
+                    continue
             
             if sheet_type in ("Employee Master", "BDC"):
                 sheets_processed.append(sheet_name)
@@ -1147,6 +1236,7 @@ class ImportService:
             "errors": state["errors"],
             "upload_id": current_upload_id,
             "is_duplicate": is_duplicate,
+            "sheet_summaries": list(state.get("sheet_summaries", {}).values()),
             
             # Spec compliance keys
             "employee_sheets": employee_sheets,
@@ -1247,7 +1337,7 @@ class ImportService:
         db.commit()
 
     @classmethod
-    def import_separation_workbook(cls, db: Session, file_content: bytes, file_name: str, operator: str = "Admin") -> Dict[str, Any]:
+    def import_separation_workbook(cls, db: Session, file_content: bytes, file_name: str, upload_mode: str = "MASTER", operator: str = "Admin") -> Dict[str, Any]:
         """Processes the Separation Workbook (NAPS, B.Tech, M.Tech) using Universal WorkbookParser."""
         import time
         import uuid
@@ -1310,8 +1400,20 @@ class ImportService:
             "rows_inactive": 0,
             "warnings": warnings,
             "errors": errors,
-            "upload_id": current_upload_id
+            "upload_id": current_upload_id,
+            "sheet_summaries": {}
         }
+
+        # Resolve upload_mode scheme scope
+        upload_mode_upper = upload_mode.upper()
+        expected_scheme = None
+        if upload_mode_upper != "MASTER":
+            if upload_mode_upper == "BTECH":
+                expected_scheme = "B.Tech"
+            elif upload_mode_upper == "MTECH":
+                expected_scheme = "M.Tech"
+            else:
+                expected_scheme = upload_mode.title() if len(upload_mode) > 4 else upload_mode.upper()
 
         sheets_processed = []
         employee_sheets = []
@@ -1324,6 +1426,20 @@ class ImportService:
         for sheet in parsed_wb["sheets"]:
             sheet_name = sheet["sheet_name"]
             sheet_type = sheet["sheet_type"]
+            
+            # Derive sheet scheme
+            first_row = sheet["rows"][0] if sheet["rows"] else {}
+            _, sheet_scheme = cls.derive_category_and_scheme(sheet_name, first_row, file_name)
+            
+            # If individual scheme mode selected, validate & warn
+            if expected_scheme and sheet_type in ("Employee Master", "BDC", "Separation"):
+                if sheet_scheme.upper().replace(".", "") != expected_scheme.upper().replace(".", ""):
+                    skipped_sheets.append(sheet_name)
+                    state["warnings"].append(
+                        f"Workbook contains sheet '{sheet_name}' which appears to belong to scheme '{sheet_scheme}', "
+                        f"but '{expected_scheme}' was selected. This sheet was skipped."
+                    )
+                    continue
             
             if sheet_type == "Separation":
                 sheets_processed.append(sheet_name)
@@ -1403,6 +1519,7 @@ class ImportService:
             "errors": state["errors"],
             "upload_id": current_upload_id,
             "is_duplicate": is_duplicate,
+            "sheet_summaries": list(state.get("sheet_summaries", {}).values()),
             
             # Spec compliance keys
             "employee_sheets": employee_sheets,

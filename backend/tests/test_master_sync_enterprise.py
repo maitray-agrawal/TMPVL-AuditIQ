@@ -244,5 +244,85 @@ class TestMasterSyncEnterprise(unittest.TestCase):
         self.assertEqual(resp.headers["content-type"], "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         self.assertIn("attachment", resp.headers["content-disposition"])
 
+    def test_modular_scheme_sync_and_filtering(self):
+        # 1. Create a workbook with both NAPS Master and B.TECH Master sheets
+        data = {
+            "NAPS Master": [
+                ["Pers No", "Complete Name", "Date of Joining", "Aadhaar Card", "Ticket Number", "Offer Letter ID"],
+                ["N123", "John Naps", "2026-01-01", "1111-2222-3333", "TKT-N123", "OFF-N123"]
+            ],
+            "B.TECH Master": [
+                ["Pers No", "Complete Name", "Date of Joining", "Aadhaar Card", "Ticket Number", "Offer Letter ID"],
+                ["B123", "Bob Btech", "2026-01-01", "4444-5555-6666", "TKT-B123", "OFF-B123"]
+            ]
+        }
+        excel_bytes = self._create_excel_file(data)
+
+        # 2. Upload with upload_mode="NAPS" (should skip B.TECH Master and warn)
+        resp = self.client.post(
+            "/api/uploads/bdc",
+            files={"file": ("naps_and_btech.xlsx", excel_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            data={"upload_mode": "NAPS"}
+        )
+        self.assertEqual(resp.status_code, 200)
+        res_data = resp.json()
+        
+        # John Naps should be inserted (1 record)
+        self.assertEqual(res_data["inserted_records"], 1)
+        self.assertIn("NAPS Master", res_data["processed_sheets"])
+        self.assertNotIn("B.TECH Master", res_data["processed_sheets"])
+        
+        # Verify warning exists for B.TECH Master being skipped
+        warnings_str = " ".join(res_data["warnings"])
+        self.assertIn("B.TECH Master", warnings_str)
+        self.assertIn("skipped", warnings_str)
+
+        # Verify sheet_summaries in response
+        sheet_sums = res_data.get("sheet_summaries", [])
+        self.assertTrue(len(sheet_sums) > 0)
+        naps_sum = next((s for s in sheet_sums if s["sheet_name"] == "NAPS Master"), None)
+        self.assertIsNotNone(naps_sum)
+        self.assertEqual(naps_sum["inserted"], 1)
+
+        # 3. Clean database and upload with upload_mode="MASTER" (should process both)
+        self.db.query(Trainee).delete()
+        self.db.commit()
+
+        resp_master = self.client.post(
+            "/api/uploads/bdc",
+            files={"file": ("naps_and_btech.xlsx", excel_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            data={"upload_mode": "MASTER"}
+        )
+        self.assertEqual(resp_master.status_code, 200)
+        res_master_data = resp_master.json()
+        self.assertEqual(res_master_data["inserted_records"], 2)
+        self.assertIn("NAPS Master", res_master_data["processed_sheets"])
+        self.assertIn("B.TECH Master", res_master_data["processed_sheets"])
+
+    def test_scheme_derivation_priority(self):
+        # Priority 1: Sheet Name
+        row = {}
+        cat, scheme = ImportService.derive_category_and_scheme("NAPS Master", row, "somefile.xlsx")
+        self.assertEqual(scheme, "NAPS")
+
+        # Priority 2: Category Column (Sheet name is generic "Trainees")
+        row_cat = {"category": "B.Tech"}
+        cat, scheme = ImportService.derive_category_and_scheme("Trainees", row_cat, "somefile.xlsx")
+        self.assertEqual(scheme, "B.Tech")
+
+        # Priority 3: Program Type / Scheme Column (Sheet name is generic, Category is missing)
+        row_prog = {"program": "M.Tech"}
+        cat, scheme = ImportService.derive_category_and_scheme("Trainees", row_prog, "somefile.xlsx")
+        self.assertEqual(scheme, "M.Tech")
+
+        # Priority 4: Workbook metadata (file name)
+        row_empty = {}
+        cat, scheme = ImportService.derive_category_and_scheme("Trainees", row_empty, "iti_sync.xlsx")
+        self.assertEqual(scheme, "ITI")
+
+        # Priority 5: Unknown
+        cat, scheme = ImportService.derive_category_and_scheme("Trainees", row_empty, "unknown.xlsx")
+        self.assertEqual(scheme, "Unknown")
+
 if __name__ == "__main__":
     unittest.main()
