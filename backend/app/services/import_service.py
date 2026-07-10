@@ -3,7 +3,7 @@ import os
 import datetime
 from typing import Dict, List, Tuple, Any, Optional
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, make_transient_to_detached
 from backend.app.repositories.repositories import TraineeRepository, InvoiceRepository, AuditLogRepository
 from backend.app.models.models import Trainee, InvoiceRecord, SeparationRecord, BDCRecord, PaymentLedger, ValidationResult, UploadHistory, TraineeLifecycle, Invoice, InvoiceItem
 from backend.app.services.workbook_parser import WorkbookParser
@@ -213,6 +213,8 @@ class ImportService:
             nonlocal sheet_inserted, sheet_updated, sheet_incomplete_inserted, sheet_incomplete_updated, sheet_duplicate_updated, sheet_identity_conflict, sheet_aadhaar_conflict, sheet_blank, sheet_failed
             nonlocal existing_by_id, existing_by_ticket, existing_by_aadhaar, existing_lcs
             
+            trainees_to_insert = {}
+            trainees_to_update = {}
             cleaned_rows = []
             
             for row in rows_to_process:
@@ -585,40 +587,70 @@ class ImportService:
                             trainee.status = "ACTIVE"
                             trainee.blocked_reason = None
 
-                        # Update existing fields
-                        trainee.name = r_name
-                        if r_doj is not None:
-                            trainee.doj = r_doj
-                        trainee.category = r_category
-                        trainee.scheme = r_scheme
-                        trainee.batch = r_batch or None
-                        trainee.shop = r_shop or None
-                        if r_aadhaar:
-                            trainee.aadhaar = r_aadhaar
-                        if r_ticket:
-                            trainee.ticket_number = r_ticket
-                        trainee.offer_id = r_offer_id or None
-                        trainee.mobile = r_mobile or None
-                        trainee.email = r_email or None
+                            # Since this is a rehire (lifecycle change), we keep it in the session (default)
+                            trainee.name = r_name
+                            if r_doj is not None:
+                                trainee.doj = r_doj
+                            trainee.category = r_category
+                            trainee.scheme = r_scheme
+                            trainee.batch = r_batch or None
+                            trainee.shop = r_shop or None
+                            if r_aadhaar:
+                                trainee.aadhaar = r_aadhaar
+                            if r_ticket:
+                                trainee.ticket_number = r_ticket
+                            trainee.offer_id = r_offer_id or None
+                            trainee.mobile = r_mobile or None
+                            trainee.email = r_email or None
 
-                        ext_data = trainee.extra_data or {}
-                        ext_data["offer_id"] = r_offer_id
-                        ext_data["mobile"] = r_mobile
-                        ext_data["email"] = r_email
-                        ext_data["validation_metadata"] = validation_metadata
-                        for k, val in unknown_data.items():
-                            ext_data[k] = val
-                        trainee.extra_data = make_json_serializable(ext_data)
+                            ext_data = trainee.extra_data or {}
+                            ext_data["offer_id"] = r_offer_id
+                            ext_data["mobile"] = r_mobile
+                            ext_data["email"] = r_email
+                            ext_data["validation_metadata"] = validation_metadata
+                            for k, val in unknown_data.items():
+                                ext_data[k] = val
+                            trainee.extra_data = make_json_serializable(ext_data)
 
-                        trainee.current_workbook = file_name
-                        trainee.current_sheet = sheet_name
+                            trainee.current_workbook = file_name
+                            trainee.current_sheet = sheet_name
+                            sheet_after_state[trainee.id] = cls._serialize_trainee_state(trainee)
+                        else:
+                            # Normal update: modify __dict__ directly to bypass ORM dirty tracking and avoid auto-update overhead
+                            ext_data = trainee.extra_data or {}
+                            ext_data["offer_id"] = r_offer_id
+                            ext_data["mobile"] = r_mobile
+                            ext_data["email"] = r_email
+                            ext_data["validation_metadata"] = validation_metadata
+                            for k, val in unknown_data.items():
+                                ext_data[k] = val
 
-                        if trainee.status not in ("SEPARATED", "BLOCKED"):
-                            trainee.status = "ACTIVE"
-                        
-                        sheet_after_state[trainee.id] = cls._serialize_trainee_state(trainee)
+                            trainee.__dict__["name"] = r_name
+                            if r_doj is not None:
+                                trainee.__dict__["doj"] = r_doj
+                            trainee.__dict__["category"] = r_category
+                            trainee.__dict__["scheme"] = r_scheme
+                            trainee.__dict__["batch"] = r_batch or None
+                            trainee.__dict__["shop"] = r_shop or None
+                            if r_aadhaar:
+                                trainee.__dict__["aadhaar"] = r_aadhaar
+                            if r_ticket:
+                                trainee.__dict__["ticket_number"] = r_ticket
+                            trainee.__dict__["offer_id"] = r_offer_id or None
+                            trainee.__dict__["mobile"] = r_mobile or None
+                            trainee.__dict__["email"] = r_email or None
+                            trainee.__dict__["extra_data"] = make_json_serializable(ext_data)
+                            trainee.__dict__["current_workbook"] = file_name
+                            trainee.__dict__["current_sheet"] = sheet_name
+                            if trainee.status not in ("SEPARATED", "BLOCKED"):
+                                trainee.__dict__["status"] = "ACTIVE"
+
+                            if trainee.id not in trainees_to_insert:
+                                trainees_to_update[trainee.id] = trainee
+
+                            sheet_after_state[trainee.id] = cls._serialize_trainee_state(trainee)
                     else:
-                        # Create new Trainee
+                        # Create new Trainee: use bulk_insert_mappings()
                         ext_data = {
                             "offer_id": r_offer_id,
                             "mobile": r_mobile,
@@ -644,9 +676,10 @@ class ImportService:
                             offer_id=r_offer_id,
                             mobile=r_mobile,
                             email=r_email,
-                            extra_data=ext_data
+                            extra_data=make_json_serializable(ext_data)
                         )
-                        db.add(new_trainee)
+                        trainees_to_insert[resolved_id] = new_trainee
+
                         existing_by_id[resolved_id] = new_trainee
                         if r_ticket:
                             existing_by_ticket[r_ticket] = new_trainee
@@ -683,6 +716,63 @@ class ImportService:
                     sheet_failed += 1
                     state["error_count"] += 1
                     state["errors"].append(f"Sheet '{sheet_name}', Row {row_num}: Database operation failed: {str(e)}")
+
+            # Defer dictionary building and bulk operations to the end of the batch
+            trainee_inserts = []
+            for t_id, trainee in trainees_to_insert.items():
+                trainee_inserts.append({
+                    "id": trainee.id,
+                    "name": trainee.name,
+                    "doj": trainee.doj,
+                    "scheme": trainee.scheme,
+                    "category": trainee.category,
+                    "batch": trainee.batch,
+                    "shop": trainee.shop,
+                    "aadhaar": trainee.aadhaar,
+                    "ticket_number": trainee.ticket_number,
+                    "status": trainee.status,
+                    "current_workbook": trainee.current_workbook,
+                    "current_sheet": trainee.current_sheet,
+                    "offer_id": trainee.offer_id,
+                    "mobile": trainee.mobile,
+                    "email": trainee.email,
+                    "extra_data": trainee.extra_data
+                })
+
+            trainee_updates = []
+            for t_id, trainee in trainees_to_update.items():
+                trainee_updates.append({
+                    "id": trainee.id,
+                    "name": trainee.name,
+                    "doj": trainee.doj,
+                    "scheme": trainee.scheme,
+                    "category": trainee.category,
+                    "batch": trainee.batch,
+                    "shop": trainee.shop,
+                    "aadhaar": trainee.aadhaar,
+                    "ticket_number": trainee.ticket_number,
+                    "status": trainee.status,
+                    "current_workbook": trainee.current_workbook,
+                    "current_sheet": trainee.current_sheet,
+                    "offer_id": trainee.offer_id,
+                    "mobile": trainee.mobile,
+                    "email": trainee.email,
+                    "extra_data": trainee.extra_data
+                })
+
+            if trainee_inserts:
+                db.bulk_insert_mappings(Trainee, trainee_inserts)
+                for insert_dict in trainee_inserts:
+                    t_obj = trainees_to_insert[insert_dict["id"]]
+                    make_transient_to_detached(t_obj)
+                    db.add(t_obj)
+                    db.expire(t_obj)
+            if trainee_updates:
+                db.bulk_update_mappings(Trainee, trainee_updates)
+                for update_dict in trainee_updates:
+                    t_obj = trainees_to_update[update_dict["id"]]
+                    db.add(t_obj)
+                    db.expire(t_obj)
 
         # End of process_batch
 
