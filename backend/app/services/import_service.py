@@ -1047,7 +1047,11 @@ class ImportService:
         db.add(upload)
         db.flush()
 
-        parsed_wb = WorkbookParser.parse_workbook(file_content, file_name)
+        # Count before import
+        count_before = db.query(Trainee).count()
+        print(f"Print count before import: {count_before}")
+
+        parsed_wb = WorkbookParser.parse_workbook(file_content, file_name, upload_mode=upload_mode)
         wb_stats = parsed_wb["stats"]
         
         warnings = list(wb_stats["warnings"])
@@ -1220,9 +1224,25 @@ class ImportService:
             commit=False
         )
         
+        print(f"rows received: {state['rows_processed']}")
+        print(f"rows inserted: {state['created_count']}")
+        print(f"rows updated: {state['updated_count']}")
+        print(f"rows skipped: {state['skip_count']}")
+        print(f"rows failed: {state['error_count']}")
+        print("commit started")
         db.commit()
+        print("commit completed")
+        # Print count after import
+        count_after = db.query(Trainee).count()
+        print(f"Print count after import: {count_after}")
 
         return {
+            "success": True,
+            "processed": state["rows_processed"],
+            "created": state["created_count"],
+            "updated": state["updated_count"] + state["separated_count"] + state["blocked_count"],
+            "failed": state["error_count"],
+            "message": f"Successfully processed {state['rows_processed']} rows.",
             "workbook_name": file_name,
             "number_of_sheets": len(parsed_wb["sheets"]) + len(skipped_sheets),
             "processed_sheets": sheets_processed,
@@ -1374,7 +1394,11 @@ class ImportService:
         db.add(upload)
         db.flush()
 
-        parsed_wb = WorkbookParser.parse_workbook(file_content, file_name)
+        # Count before import
+        count_before = db.query(Trainee).count()
+        print(f"Print count before import: {count_before}")
+
+        parsed_wb = WorkbookParser.parse_workbook(file_content, file_name, upload_mode=upload_mode)
         wb_stats = parsed_wb["stats"]
         
         warnings = list(wb_stats["warnings"])
@@ -1503,9 +1527,25 @@ class ImportService:
             commit=False
         )
         
+        print(f"rows received: {state['rows_processed']}")
+        print(f"rows inserted: {state['separated_count'] + state['blocked_count']}")
+        print(f"rows updated: {state['skip_count']}")
+        print(f"rows skipped: {state['skipped_count'] - state['error_count']}")
+        print(f"rows failed: {state['error_count']}")
+        print("commit started")
         db.commit()
+        print("commit completed")
+        # Print count after import
+        count_after = db.query(Trainee).count()
+        print(f"Print count after import: {count_after}")
         
         return {
+            "success": True,
+            "processed": state["rows_processed"],
+            "created": state["separated_count"] + state["blocked_count"],
+            "updated": state["skip_count"],
+            "failed": state["error_count"],
+            "message": f"Successfully processed {state['rows_processed']} rows.",
             "workbook_name": file_name,
             "number_of_sheets": len(parsed_wb["sheets"]) + len(skipped_sheets),
             "processed_sheets": sheets_processed,
@@ -1894,12 +1934,31 @@ class ImportService:
         if existing_upload:
             is_duplicate = True
             duplicate_warning = f"Invoice file '{file_name}' was already uploaded previously (Upload ID: {existing_upload.upload_id})."
+
+        # Create UploadHistory first and flush it to the session to prevent FOREIGN KEY constraint issues
+        upload = UploadHistory(
+            upload_id=current_upload_id,
+            file_name=file_name,
+            file_hash=file_hash,
+            file_size=file_size,
+            upload_type="INVOICE",
+            uploaded_by=operator,
+            processing_time=0.0,
+            status="PROCESSING",
+            is_duplicate=is_duplicate,
+            remarks=duplicate_warning
+        )
+        db.add(upload)
+        db.flush()
         
         is_pdf = file_name.lower().endswith(".pdf")
+        # Count before import
+        count_before = db.query(InvoiceItem).count()
+        print(f"Print count before import: {count_before}")
         if is_pdf:
             parsed_wb = cls.parse_pdf_invoice(file_content, file_name)
         else:
-            parsed_wb = WorkbookParser.parse_workbook(file_content, file_name)
+            parsed_wb = WorkbookParser.parse_workbook(file_content, file_name, upload_mode="INVOICE")
             
         wb_stats = parsed_wb["stats"]
         
@@ -2183,11 +2242,22 @@ class ImportService:
                 for i in range(0, len(sheet["rows"]), BATCH_SIZE):
                     process_batch(sheet["rows"][i:i+BATCH_SIZE], sheet_name, invoice)
                 invoice.total_amount = sheet_total_amount
+                print(f"rows received: {success_count + skipped_count}")
+                print(f"rows inserted: {success_count}")
+                print(f"rows updated: 0")
+                print(f"rows skipped: {skipped_count - error_count}")
+                print(f"rows failed: {error_count}")
+                print("commit started")
                 db.commit()
+                print("commit completed")
+                # Print count after import
+                count_after = db.query(InvoiceItem).count()
+                print(f"Print count after import: {count_after}")
             except Exception as e:
                 failed_sheets.append(sheet_name)
                 error_count += 1
                 errors.append(f"Failed to process sheet '{sheet_name}': {str(e)}")
+                print("rollback")
                 db.rollback()
                 
         if not sheets_processed:
@@ -2199,34 +2269,25 @@ class ImportService:
         if failed_sheets:
             upload_status = "PARTIAL" if sheets_processed else "FAILED"
 
-        # Log upload history record
-        cls._save_upload_history(
-            db=db,
-            upload_id=current_upload_id,
-            file_name=file_name,
-            file_hash=file_hash,
-            file_size=file_size,
-            upload_type="INVOICE",
-            uploaded_by=operator,
-            processing_time=total_duration,
-            status=upload_status,
-            is_duplicate=is_duplicate,
-            stats=wb_stats,
-            state={
-                "rows_processed": success_count + skipped_count,
-                "created_count": success_count,
-                "updated_count": 0,
-                "rows_no_change": 0,
-                "skip_count": skipped_count - error_count,
-                "error_count": error_count,
-                "rows_rehired": 0,
-                "rows_inactive": 0
-            },
-            employee_sheets=[],
-            separation_sheets=[],
-            invoice_sheets=sheets_processed,
-            remarks=duplicate_warning
-        )
+        # Update existing UploadHistory summary fields in database
+        upload.status = upload_status
+        upload.processing_time = total_duration
+        upload.workbook_version = wb_stats.get("workbook_version")
+        upload.parser_version = wb_stats.get("parser_version", "2.0.0")
+        upload.sheet_count = wb_stats.get("number_of_sheets", 0)
+        upload.visible_sheet_count = len(sheets_processed)
+        upload.hidden_sheet_count = len(skipped_sheets)
+        upload.rows_processed = success_count + skipped_count
+        upload.rows_inserted = success_count
+        upload.rows_updated = 0
+        upload.rows_no_change = 0
+        upload.rows_skipped = skipped_count - error_count
+        upload.rows_failed = error_count
+        upload.employee_sheets = []
+        upload.separation_sheets = []
+        upload.invoice_sheets = sheets_processed
+        upload.remarks = duplicate_warning
+        db.flush()
         
         AuditLogRepository.add_log(
             db=db,
@@ -2250,6 +2311,12 @@ class ImportService:
         )
         
         return {
+            "success": True,
+            "processed": success_count + skipped_count,
+            "created": success_count,
+            "updated": 0,
+            "failed": error_count,
+            "message": f"Successfully processed {success_count + skipped_count} rows.",
             "workbook_name": file_name,
             "number_of_sheets": len(parsed_wb["sheets"]) + len(skipped_sheets),
             "processed_sheets": sheets_processed,

@@ -255,6 +255,13 @@ app.add_middleware(
 # Register routes
 app.include_router(router, prefix="/api")
 
+@app.on_event("startup")
+def startup_event():
+    print("Registered upload endpoints:")
+    for route in app.routes:
+        if hasattr(route, "path") and "upload" in route.path:
+            print(route.path)
+
 @app.get("/")
 def read_root():
     return {

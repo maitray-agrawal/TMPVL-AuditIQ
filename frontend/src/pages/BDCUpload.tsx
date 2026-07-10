@@ -84,6 +84,20 @@ const UploadCard: React.FC<UploadCardProps> = ({
       const formData = new FormData();
       formData.append('file', file);
       formData.append('upload_mode', uploadMode);
+      formData.append('scheme', uploadMode);
+
+      console.log('Sending upload request:', {
+        url: uploadUrl,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'multipart/form-data',
+        },
+        formData: {
+          file: file.name,
+          upload_mode: uploadMode,
+          scheme: uploadMode
+        }
+      });
 
       const res = await api.post(uploadUrl, formData, {
         headers: {
@@ -414,7 +428,7 @@ export const BDCUpload: React.FC = () => {
             templatePath="/templates/BDC_Template.xlsx"
             description="Download the master template containing sample NAPS, BTECH, and MTECH sheets."
             tooltipText="Using the master template ensures all sheets are classified and ingested automatically."
-            uploadUrl="/api/uploads/bdc"
+            uploadUrl="/uploads/bdc"
             uploadMode="MASTER"
             color="primary"
             noteText="Upload a workbook containing multiple sheets. The import engine will automatically detect and process NAPS, B.TECH, M.TECH, and any future Employee Master sheets."
@@ -437,7 +451,7 @@ export const BDCUpload: React.FC = () => {
             templatePath="/templates/BDC_Template.xlsx"
             description="Download the template and upload trainee records belonging exclusively to NAPS scheme."
             tooltipText="Ensure the sheet contains Trainee ID and Joining Date matching the NAPS synonyms."
-            uploadUrl="/api/uploads/bdc"
+            uploadUrl="/uploads/bdc/naps"
             uploadMode="NAPS"
             color="primary"
             noteText="Ingest records exclusively for the National Apprenticeship Promotion Scheme (NAPS)."
@@ -451,7 +465,7 @@ export const BDCUpload: React.FC = () => {
             templatePath="/templates/BDC_Template.xlsx"
             description="Download the template and upload trainee records belonging exclusively to B.TECH scheme."
             tooltipText="Ensure the sheet contains Trainee ID and Joining Date matching the BTECH synonyms."
-            uploadUrl="/api/uploads/bdc"
+            uploadUrl="/uploads/bdc/btech"
             uploadMode="BTECH"
             color="primary"
             noteText="Ingest records exclusively for the B.TECH Trainee Program."
@@ -465,7 +479,7 @@ export const BDCUpload: React.FC = () => {
             templatePath="/templates/BDC_Template.xlsx"
             description="Download the template and upload trainee records belonging exclusively to M.TECH scheme."
             tooltipText="Ensure the sheet contains Trainee ID and Joining Date matching the MTECH synonyms."
-            uploadUrl="/api/uploads/bdc"
+            uploadUrl="/uploads/bdc/mtech"
             uploadMode="MTECH"
             color="primary"
             noteText="Ingest records exclusively for the M.TECH Trainee Program."

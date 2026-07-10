@@ -84,6 +84,20 @@ const UploadCard: React.FC<UploadCardProps> = ({
       const formData = new FormData();
       formData.append('file', file);
       formData.append('upload_mode', uploadMode);
+      formData.append('scheme', uploadMode);
+
+      console.log('Sending upload request:', {
+        url: uploadUrl,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'multipart/form-data',
+        },
+        formData: {
+          file: file.name,
+          upload_mode: uploadMode,
+          scheme: uploadMode
+        }
+      });
 
       const res = await api.post(uploadUrl, formData, {
         headers: {
@@ -414,7 +428,7 @@ export const SeparationUpload: React.FC = () => {
             templatePath="/templates/Separation_Template.xlsx"
             description="Download the master template containing sample separation sheets for NAPS, BTECH, and MTECH."
             tooltipText="Using the master template ensures all sheets are classified and ingested automatically."
-            uploadUrl="/api/uploads/separation"
+            uploadUrl="/uploads/separation"
             uploadMode="MASTER"
             color="secondary"
             noteText="Upload workbook containing all separation sheets. Automatically process every valid Separation sheet for NAPS, B.TECH, M.TECH, and future schemes."
@@ -437,7 +451,7 @@ export const SeparationUpload: React.FC = () => {
             templatePath="/templates/Separation_Template.xlsx"
             description="Download the template and upload separation records belonging exclusively to NAPS scheme."
             tooltipText="Ensure the sheet contains Trainee ID or Ticket Number and Separation Date matching NAPS."
-            uploadUrl="/api/uploads/separation"
+            uploadUrl="/uploads/separation/naps"
             uploadMode="NAPS"
             color="secondary"
             noteText="Ingest separations exclusively for the National Apprenticeship Promotion Scheme (NAPS)."
@@ -451,7 +465,7 @@ export const SeparationUpload: React.FC = () => {
             templatePath="/templates/Separation_Template.xlsx"
             description="Download the template and upload separation records belonging exclusively to B.TECH scheme."
             tooltipText="Ensure the sheet contains Trainee ID or Ticket Number and Separation Date matching BTECH."
-            uploadUrl="/api/uploads/separation"
+            uploadUrl="/uploads/separation/btech"
             uploadMode="BTECH"
             color="secondary"
             noteText="Ingest separations exclusively for the B.TECH Trainee Program."
@@ -465,7 +479,7 @@ export const SeparationUpload: React.FC = () => {
             templatePath="/templates/Separation_Template.xlsx"
             description="Download the template and upload separation records belonging exclusively to M.TECH scheme."
             tooltipText="Ensure the sheet contains Trainee ID or Ticket Number and Separation Date matching MTECH."
-            uploadUrl="/api/uploads/separation"
+            uploadUrl="/uploads/separation/mtech"
             uploadMode="MTECH"
             color="secondary"
             noteText="Ingest separations exclusively for the M.TECH Trainee Program."

@@ -527,34 +527,220 @@ def unblock_trainee(trainee_id: str, db: Session = Depends(get_db)):
 async def upload_bdc(
     file: UploadFile = File(...),
     upload_mode: str = Form("MASTER"),
+    scheme: Optional[str] = Form(None),
     admin: str = Depends(get_offline_user),
     db: Session = Depends(get_db)
 ):
+    print(f"filename: {file.filename}")
+    print(f"content_type: {file.content_type}")
     content, filename = await _read_upload_safely(file)
+    print(f"file size: {len(content)}")
+    print(f"upload_mode: {upload_mode}")
+    print(f"scheme: {scheme}")
     try:
         return ImportService.import_bdc_workbook(db, content, filename, upload_mode=upload_mode, operator=admin)
     except HTTPException:
         raise
     except Exception as exc:
+        import traceback
+        import logging
+        logger = logging.getLogger("endpoints")
+        logger.exception("Upload BDC failed")
+        tb = traceback.format_exc()
+        print("rollback")
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=f"{str(exc)}\n{tb}")
+
+
+@router.post("/uploads/bdc/naps")
+async def upload_bdc_naps(
+    file: UploadFile = File(...),
+    admin: str = Depends(get_offline_user),
+    db: Session = Depends(get_db)
+):
+    print(f"filename: {file.filename}")
+    print(f"content_type: {file.content_type}")
+    content, filename = await _read_upload_safely(file)
+    print(f"file size: {len(content)}")
+    print(f"upload_mode: NAPS")
+    print(f"scheme: NAPS")
+    try:
+        return ImportService.import_bdc_workbook(db, content, filename, upload_mode="NAPS", operator=admin)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        import traceback
+        import logging
+        logger = logging.getLogger("endpoints")
+        logger.exception("Upload BDC NAPS failed")
+        tb = traceback.format_exc()
+        print("rollback")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"{str(exc)}\n{tb}")
+
+
+@router.post("/uploads/bdc/btech")
+async def upload_bdc_btech(
+    file: UploadFile = File(...),
+    admin: str = Depends(get_offline_user),
+    db: Session = Depends(get_db)
+):
+    print(f"filename: {file.filename}")
+    print(f"content_type: {file.content_type}")
+    content, filename = await _read_upload_safely(file)
+    print(f"file size: {len(content)}")
+    print(f"upload_mode: BTECH")
+    print(f"scheme: BTECH")
+    try:
+        return ImportService.import_bdc_workbook(db, content, filename, upload_mode="BTECH", operator=admin)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        import traceback
+        import logging
+        logger = logging.getLogger("endpoints")
+        logger.exception("Upload BDC BTECH failed")
+        tb = traceback.format_exc()
+        print("rollback")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"{str(exc)}\n{tb}")
+
+
+@router.post("/uploads/bdc/mtech")
+async def upload_bdc_mtech(
+    file: UploadFile = File(...),
+    admin: str = Depends(get_offline_user),
+    db: Session = Depends(get_db)
+):
+    print(f"filename: {file.filename}")
+    print(f"content_type: {file.content_type}")
+    content, filename = await _read_upload_safely(file)
+    print(f"file size: {len(content)}")
+    print(f"upload_mode: MTECH")
+    print(f"scheme: MTECH")
+    try:
+        return ImportService.import_bdc_workbook(db, content, filename, upload_mode="MTECH", operator=admin)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        import traceback
+        import logging
+        logger = logging.getLogger("endpoints")
+        logger.exception("Upload BDC MTECH failed")
+        tb = traceback.format_exc()
+        print("rollback")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"{str(exc)}\n{tb}")
 
 
 @router.post("/uploads/separation")
 async def upload_separation(
     file: UploadFile = File(...),
     upload_mode: str = Form("MASTER"),
+    scheme: Optional[str] = Form(None),
     admin: str = Depends(get_offline_user),
     db: Session = Depends(get_db)
 ):
+    print(f"filename: {file.filename}")
+    print(f"content_type: {file.content_type}")
     content, filename = await _read_upload_safely(file)
+    print(f"file size: {len(content)}")
+    print(f"upload_mode: {upload_mode}")
+    print(f"scheme: {scheme}")
     try:
         return ImportService.import_separation_workbook(db, content, filename, upload_mode=upload_mode, operator=admin)
     except HTTPException:
         raise
     except Exception as exc:
+        import traceback
+        import logging
+        logger = logging.getLogger("endpoints")
+        logger.exception("Upload Separation failed")
+        tb = traceback.format_exc()
+        print("rollback")
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=f"{str(exc)}\n{tb}")
+
+
+@router.post("/uploads/separation/naps")
+async def upload_separation_naps(
+    file: UploadFile = File(...),
+    admin: str = Depends(get_offline_user),
+    db: Session = Depends(get_db)
+):
+    print(f"filename: {file.filename}")
+    print(f"content_type: {file.content_type}")
+    content, filename = await _read_upload_safely(file)
+    print(f"file size: {len(content)}")
+    print(f"upload_mode: NAPS")
+    print(f"scheme: NAPS")
+    try:
+        return ImportService.import_separation_workbook(db, content, filename, upload_mode="NAPS", operator=admin)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        import traceback
+        import logging
+        logger = logging.getLogger("endpoints")
+        logger.exception("Upload Separation NAPS failed")
+        tb = traceback.format_exc()
+        print("rollback")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"{str(exc)}\n{tb}")
+
+
+@router.post("/uploads/separation/btech")
+async def upload_separation_btech(
+    file: UploadFile = File(...),
+    admin: str = Depends(get_offline_user),
+    db: Session = Depends(get_db)
+):
+    print(f"filename: {file.filename}")
+    print(f"content_type: {file.content_type}")
+    content, filename = await _read_upload_safely(file)
+    print(f"file size: {len(content)}")
+    print(f"upload_mode: BTECH")
+    print(f"scheme: BTECH")
+    try:
+        return ImportService.import_separation_workbook(db, content, filename, upload_mode="BTECH", operator=admin)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        import traceback
+        import logging
+        logger = logging.getLogger("endpoints")
+        logger.exception("Upload Separation BTECH failed")
+        tb = traceback.format_exc()
+        print("rollback")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"{str(exc)}\n{tb}")
+
+
+@router.post("/uploads/separation/mtech")
+async def upload_separation_mtech(
+    file: UploadFile = File(...),
+    admin: str = Depends(get_offline_user),
+    db: Session = Depends(get_db)
+):
+    print(f"filename: {file.filename}")
+    print(f"content_type: {file.content_type}")
+    content, filename = await _read_upload_safely(file)
+    print(f"file size: {len(content)}")
+    print(f"upload_mode: MTECH")
+    print(f"scheme: MTECH")
+    try:
+        return ImportService.import_separation_workbook(db, content, filename, upload_mode="MTECH", operator=admin)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        import traceback
+        import logging
+        logger = logging.getLogger("endpoints")
+        logger.exception("Upload Separation MTECH failed")
+        tb = traceback.format_exc()
+        print("rollback")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"{str(exc)}\n{tb}")
 
 
 @router.post("/uploads/invoice")
@@ -566,6 +752,11 @@ async def upload_invoice(
     db: Session = Depends(get_db),
 ):
     content, filename = await _read_upload_safely(file, allowed_extensions={".xlsx", ".xls", ".pdf"})
+    print(f"filename: {file.filename}")
+    print(f"content_type: {file.content_type}")
+    print(f"file size: {len(content)}")
+    print(f"upload_mode: INVOICE")
+    print(f"scheme: INVOICE")
 
     inv_date: Optional[datetime.date] = None
     if invoice_date:
@@ -589,8 +780,14 @@ async def upload_invoice(
     except HTTPException:
         raise
     except Exception as exc:
+        import traceback
+        import logging
+        logger = logging.getLogger("endpoints")
+        logger.exception("Upload Invoice failed")
+        tb = traceback.format_exc()
+        print("rollback")
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=f"{str(exc)}\n{tb}")
 
 
 @router.post("/uploads/analyze")

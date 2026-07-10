@@ -446,7 +446,7 @@ class WorkbookParser:
         return merged_map
 
     @classmethod
-    def parse_workbook(cls, file_content: bytes, file_name: str) -> Dict[str, Any]:
+    def parse_workbook(cls, file_content: bytes, file_name: str, upload_mode: str = "MASTER") -> Dict[str, Any]:
         """
         Main parser entry point.
         Loads workbook, detects types (supporting standard BDC/Separation/Invoice and Unknown types),
@@ -456,6 +456,25 @@ class WorkbookParser:
         # Determine if we should load read-only (files larger than 10MB)
         is_large_file = len(file_content) > 10 * 1024 * 1024
         wb = openpyxl.load_workbook(io.BytesIO(file_content), read_only=is_large_file, data_only=True)
+        
+        print("Workbook loaded")
+        print(f"Sheet names: {wb.sheetnames}")
+        
+        # Simple heuristic for workbook type
+        detected_type = "Unknown"
+        for name in wb.sheetnames:
+            name_lower = name.lower()
+            if "separation" in name_lower:
+                detected_type = "Separation"
+                break
+            elif "invoice" in name_lower:
+                detected_type = "Invoice"
+                break
+            elif any(k in name_lower for k in ("bdc", "master", "trainee", "naps", "btech", "mtech")):
+                detected_type = "Employee Master / BDC"
+                break
+        print(f"Detected workbook type: {detected_type}")
+        print(f"Detected upload mode: {upload_mode}")
         
         stats = {
             "workbook_name": file_name,
@@ -474,6 +493,14 @@ class WorkbookParser:
             
             # 1. Ignore hidden sheets
             if ws.sheet_state != 'visible':
+                print(f"sheet name: {sheet_name}")
+                print("classification: Ignored")
+                print("header row: N/A")
+                print("number of rows: 0")
+                print("valid rows: 0")
+                print("skipped rows: 0")
+                print("ignored rows: All")
+                print("reason ignored: Sheet is hidden")
                 stats["skipped_sheets"].append(sheet_name)
                 stats["warnings"].append(f"Sheet '{sheet_name}' skipped: Sheet is hidden.")
                 continue
@@ -494,6 +521,14 @@ class WorkbookParser:
                     break
 
             if is_empty:
+                print(f"sheet name: {sheet_name}")
+                print("classification: Ignored")
+                print("header row: N/A")
+                print("number of rows: 0")
+                print("valid rows: 0")
+                print("skipped rows: 0")
+                print("ignored rows: All")
+                print("reason ignored: Sheet is empty")
                 stats["skipped_sheets"].append(sheet_name)
                 stats["warnings"].append(f"Sheet '{sheet_name}' skipped: Sheet is empty.")
                 continue
@@ -626,6 +661,15 @@ class WorkbookParser:
                     rows_data.append(row_dict)
                     valid_rows_count += 1
 
+                print(f"sheet name: {sheet_name}")
+                print(f"classification: {sheet_type}")
+                print(f"header row: {header_idx}")
+                print(f"number of rows: {len(rows_data) + blank_rows_count}")
+                print(f"valid rows: {valid_rows_count}")
+                print(f"skipped rows: 0")
+                print(f"ignored rows: {blank_rows_count}")
+                print(f"reason ignored: Blank rows")
+
                 parsed_sheets.append({
                     "sheet_name": sheet_name,
                     "sheet_type": sheet_type,
@@ -639,6 +683,14 @@ class WorkbookParser:
                 })
 
             except Exception as e:
+                print(f"sheet name: {sheet_name}")
+                print("classification: Failed")
+                print("header row: N/A")
+                print("number of rows: 0")
+                print("valid rows: 0")
+                print("skipped rows: 0")
+                print("ignored rows: All")
+                print(f"reason ignored: Failed parsing sheet: {str(e)}")
                 stats["failed_sheets"].append(sheet_name)
                 stats["errors"].append(f"Failed parsing sheet '{sheet_name}': {str(e)}")
 
