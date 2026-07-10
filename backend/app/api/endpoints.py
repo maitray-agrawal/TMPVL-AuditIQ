@@ -111,12 +111,20 @@ def get_dashboard_stats(db: Session = Depends(get_db)):
     try:
         trainee_counts = TraineeRepository.count_by_status(db)
 
-        # 1. Scheme Breakdown
-        scheme_counts = db.query(Trainee.scheme, func.count(Trainee.id)).group_by(Trainee.scheme).all()
+        # 1. Scheme Breakdown - Only count trainees imported from Employee Master (BDC Master)
+        scheme_counts = db.query(
+            Trainee.scheme,
+            func.count(Trainee.id)
+        ).filter(
+            Trainee.doj.isnot(None)
+        ).group_by(
+            Trainee.scheme
+        ).all()
         scheme_map = {s: count for s, count in scheme_counts}
         naps_count = scheme_map.get("NAPS", 0)
         btech_count = scheme_map.get("B.Tech", 0)
         mtech_count = scheme_map.get("M.Tech", 0)
+        total_master_trainees = db.query(func.count(Trainee.id)).filter(Trainee.doj.isnot(None)).scalar() or 0
 
         # 2. Join / Separation / Early exit this month
         today = datetime.date.today()
@@ -240,7 +248,7 @@ def get_dashboard_stats(db: Session = Depends(get_db)):
         chart_payments = [{"month": m, "amount": float(amount or 0.0)} for m, amount in payments_by_month if m]
 
         return {
-            "total_trainees": trainee_counts["total"],
+            "total_trainees": total_master_trainees,
             "active_trainees": trainee_counts["ACTIVE"],
             "blocked_trainees": trainee_counts["BLOCKED"],
             "separated_trainees": trainee_counts["SEPARATED"],

@@ -347,7 +347,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onPageChange }) => {
         </Grid>
         <Grid size={{ xs: 6, sm: 4, md: 2.4 }}>
           <KpiCard 
-            label="Separated" 
+            label="Separated Employees" 
             value={stats.separated_trainees} 
             sub="Trainees left (compliant)"
             icon={<UserMinus size={16} />} 

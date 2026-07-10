@@ -2,6 +2,7 @@ import re
 import os
 import datetime
 from typing import Dict, List, Tuple, Any, Optional
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from backend.app.repositories.repositories import TraineeRepository, InvoiceRepository, AuditLogRepository
 from backend.app.models.models import Trainee, InvoiceRecord, SeparationRecord, BDCRecord, PaymentLedger, ValidationResult, UploadHistory, TraineeLifecycle, Invoice, InvoiceItem
@@ -75,6 +76,18 @@ class ImportService:
 
     @classmethod
     def derive_category_and_scheme(cls, sheet_name: str, row_dict: Dict[str, Any], file_name: str = "") -> Tuple[str, str]:
+        if not hasattr(cls, "_DERIVE_CACHE"):
+            cls._DERIVE_CACHE = {}
+
+        category_syns = ["category", "traineecategory", "empcategory", "employeecategory"]
+        program_syns = ["scheme", "program", "course", "type", "schemetype", "programtype", "program/scheme"]
+        raw_cat = cls.get_column_value(row_dict, category_syns)
+        raw_prog = cls.get_column_value(row_dict, program_syns)
+
+        cache_key = (sheet_name, raw_cat, raw_prog, file_name)
+        if cache_key in cls._DERIVE_CACHE:
+            return cls._DERIVE_CACHE[cache_key]
+
         # Helper to normalize category and scheme names
         def normalize_res(val_str: str) -> Optional[Tuple[str, str]]:
             val_clean = str(val_str).strip().upper()
@@ -101,22 +114,21 @@ class ImportService:
         # Priority 1: Sheet Name
         sheet_res = normalize_res(sheet_name)
         if sheet_res:
+            cls._DERIVE_CACHE[cache_key] = sheet_res
             return sheet_res
 
         # Priority 2: Category Column
-        category_syns = ["category", "traineecategory", "empcategory", "employeecategory"]
-        raw_cat = cls.get_column_value(row_dict, category_syns)
         if raw_cat:
             cat_res = normalize_res(str(raw_cat))
             if cat_res:
+                cls._DERIVE_CACHE[cache_key] = cat_res
                 return cat_res
 
         # Priority 3: Program Type / Scheme Column
-        program_syns = ["scheme", "program", "course", "type", "schemetype", "programtype", "program/scheme"]
-        raw_prog = cls.get_column_value(row_dict, program_syns)
         if raw_prog:
             prog_res = normalize_res(str(raw_prog))
             if prog_res:
+                cls._DERIVE_CACHE[cache_key] = prog_res
                 return prog_res
 
         # Priority 4: Workbook metadata (file name)
@@ -124,9 +136,11 @@ class ImportService:
             base_name = file_name.rsplit('.', 1)[0]
             file_res = normalize_res(base_name)
             if file_res:
+                cls._DERIVE_CACHE[cache_key] = file_res
                 return file_res
 
         # Priority 5: Unknown
+        cls._DERIVE_CACHE[cache_key] = ("UNKNOWN", "Unknown")
         return "UNKNOWN", "Unknown"
 
     @classmethod
@@ -176,6 +190,19 @@ class ImportService:
             if norm_h in WorkbookParser.SYNONYMS["aadhaar"]:
                 has_aadhaar_col = True
 
+        # 1. Preload all trainees and lifecycles once per sheet to avoid N+1 bottlenecks
+        t_dup_start = time.time()
+        all_trainees = db.query(Trainee).all()
+        existing_by_id = {t.id: t for t in all_trainees}
+        existing_by_ticket = {t.ticket_number: t for t in all_trainees if t.ticket_number}
+        existing_by_aadhaar = {t.aadhaar: t for t in all_trainees if t.aadhaar}
+
+        all_lcs = db.query(TraineeLifecycle.trainee_id, TraineeLifecycle.joining_date, TraineeLifecycle.leaving_date).all()
+        existing_lcs = {(lc_id, lc_j, lc_l) for lc_id, lc_j, lc_l in all_lcs}
+        dup_resolution_duration = time.time() - t_dup_start
+        state.setdefault("dup_resolution_time", 0.0)
+        state["dup_resolution_time"] += dup_resolution_duration
+
         seen_trainee_ids = set()
         seen_tickets = set()
         all_synonyms = set()
@@ -184,11 +211,7 @@ class ImportService:
 
         def process_batch(rows_to_process):
             nonlocal sheet_inserted, sheet_updated, sheet_incomplete_inserted, sheet_incomplete_updated, sheet_duplicate_updated, sheet_identity_conflict, sheet_aadhaar_conflict, sheet_blank, sheet_failed
-            
-            # Extract standard key mappings for bulk database lookups
-            batch_trainee_ids = set()
-            batch_tickets = set()
-            batch_aadhaars = set()
+            nonlocal existing_by_id, existing_by_ticket, existing_by_aadhaar, existing_lcs
             
             cleaned_rows = []
             
@@ -229,6 +252,7 @@ class ImportService:
                 if r_batch.lower() == 'nan': r_batch = ""
                 if r_shop.lower() == 'nan': r_shop = ""
 
+                # Category and scheme are resolved per row using the fast cached resolver
                 r_category, r_scheme = cls.derive_category_and_scheme(sheet_name, row, file_name)
 
                 cleaned_rows.append({
@@ -247,27 +271,9 @@ class ImportService:
                     "scheme": r_scheme,
                     "raw_row": row
                 })
-                
-                if r_id: batch_trainee_ids.add(r_id)
-                if r_ticket: batch_tickets.add(r_ticket)
-                if r_aadhaar: batch_aadhaars.add(r_aadhaar)
 
             if not cleaned_rows:
                 return
-
-            # Bulk lookups for database identity checks
-            existing_by_id = {}
-            if batch_trainee_ids:
-                res_ids = db.query(Trainee).filter(Trainee.id.in_(batch_trainee_ids)).all()
-                existing_by_id = {t.id: t for t in res_ids}
-            existing_by_ticket = {}
-            if batch_tickets:
-                res_tickets = db.query(Trainee).filter(Trainee.ticket_number.in_(batch_tickets)).all()
-                existing_by_ticket = {t.ticket_number: t for t in res_tickets}
-            existing_by_aadhaar = {}
-            if batch_aadhaars:
-                res_aadhaars = db.query(Trainee).filter(Trainee.aadhaar.in_(batch_aadhaars)).all()
-                existing_by_aadhaar = {t.aadhaar: t for t in res_aadhaars}
 
             for item in cleaned_rows:
                 row_num = item["row_num"]
@@ -550,12 +556,8 @@ class ImportService:
 
                             # Guard: only create a lifecycle archive if separation upload
                             # hasn't already written one for the same date range.
-                            existing_lc = db.query(TraineeLifecycle).filter(
-                                TraineeLifecycle.trainee_id == trainee.id,
-                                TraineeLifecycle.joining_date == trainee.doj,
-                                TraineeLifecycle.leaving_date == trainee.dol,
-                            ).first()
-                            if not existing_lc:
+                            has_existing_lc = (trainee.id, trainee.doj, trainee.dol) in existing_lcs
+                            if not has_existing_lc:
                                 old_lc = TraineeLifecycle(
                                     trainee_id=trainee.id,
                                     joining_date=trainee.doj,
@@ -576,6 +578,7 @@ class ImportService:
                                 )
                                 db.add(old_lc)
                                 db.flush()
+                                existing_lcs.add((trainee.id, trainee.doj, trainee.dol))
                             state["rows_rehired"] += 1
 
                             trainee.dol = None
@@ -681,13 +684,24 @@ class ImportService:
                     state["error_count"] += 1
                     state["errors"].append(f"Sheet '{sheet_name}', Row {row_num}: Database operation failed: {str(e)}")
 
-            db.flush()
+        # End of process_batch
 
-        # Run process_batch in batches
-        for i in range(0, len(sheet["rows"]), BATCH_SIZE):
+        # Run process_batch in batches of 500, commit and print progress
+        BATCH_SIZE = 500
+        total_rows = len(sheet["rows"])
+        batch_num = 1
+        for i in range(0, total_rows, BATCH_SIZE):
             process_batch(sheet["rows"][i:i+BATCH_SIZE])
+            print(f"Processing {min(i + BATCH_SIZE, total_rows)} / {total_rows}")
+            db.flush()
+            db.commit()
+            print(f"Commit Batch {batch_num}")
+            batch_num += 1
 
         sheet_duration = time.time() - sheet_start_time
+        db_insert_duration = max(0.0, sheet_duration - dup_resolution_duration)
+        state.setdefault("db_insert_time", 0.0)
+        state["db_insert_time"] += db_insert_duration
         
         parsed_rows = len(sheet["rows"]) + sheet["blank_rows"]
         sheet_incomplete = sheet_incomplete_inserted + sheet_incomplete_updated
@@ -784,10 +798,26 @@ class ImportService:
         first_row = sheet["rows"][0] if sheet["rows"] else {}
         _, sheet_scheme = cls.derive_category_and_scheme(sheet_name, first_row, file_name)
 
+        # Preload trainees to avoid DB lookup N+1 bottleneck
+        t_dup_start = time.time()
+        all_trainees = db.query(Trainee).all()
+        existing_trainees = {}
+        for t in all_trainees:
+            existing_trainees[t.id] = t
+            if t.ticket_number:
+                existing_trainees[t.ticket_number] = t
+
+        # Preload separation records
+        all_seps = db.query(SeparationRecord.trainee_id, SeparationRecord.dol).all()
+        existing_seps = {(sep_id, sep_dol) for sep_id, sep_dol in all_seps}
+        dup_resolution_duration = time.time() - t_dup_start
+        state.setdefault("dup_resolution_time", 0.0)
+        state["dup_resolution_time"] += dup_resolution_duration
+
         def process_batch(rows_to_process):
             nonlocal sheet_inserted, sheet_updated, sheet_incomplete, sheet_duplicate_updated, sheet_identity_conflict, sheet_blank, sheet_failed, sheet_separated, sheet_blocked
+            nonlocal existing_trainees, existing_seps
             
-            batch_trainee_ids = set()
             cleaned_rows = []
             
             for row in rows_to_process:
@@ -818,22 +848,9 @@ class ImportService:
                     "dol": dol,
                     "reason": reason
                 })
-                if trainee_id:
-                    batch_trainee_ids.add(trainee_id)
 
             if not cleaned_rows:
                 return
-
-            # Lookup existing trainees
-            existing_trainees = {
-                t.id: t for t in db.query(Trainee).filter(Trainee.id.in_(batch_trainee_ids)).all()
-            }
-            missing_ids = batch_trainee_ids - set(existing_trainees.keys())
-            if missing_ids:
-                by_ticket = db.query(Trainee).filter(Trainee.ticket_number.in_(missing_ids)).all()
-                for t in by_ticket:
-                    existing_trainees[t.ticket_number] = t
-                    existing_trainees[t.id] = t
 
             for item in cleaned_rows:
                 row_num = item["row_num"]
@@ -943,12 +960,9 @@ class ImportService:
                             sheet_updated += 1
 
                     # Save separation record
-                    existing_rec = db.query(SeparationRecord).filter(
-                        SeparationRecord.trainee_id == trainee.id,
-                        SeparationRecord.dol == dol
-                    ).first()
+                    has_existing_rec = (trainee.id, dol) in existing_seps
 
-                    if not existing_rec:
+                    if not has_existing_rec:
                         sep_rec = SeparationRecord(
                             trainee_id=trainee.id,
                             dol=dol,
@@ -967,6 +981,7 @@ class ImportService:
                             }
                         )
                         db.add(sep_rec)
+                        existing_seps.add((trainee.id, dol))
 
                         # Write a TraineeLifecycle record to preserve history
                         sep_lc = TraineeLifecycle(
@@ -1000,13 +1015,24 @@ class ImportService:
                     state["error_count"] += 1
                     state["errors"].append(f"Sheet '{sheet_name}', Row {row_num}: Database operation failed: {str(e)}")
 
-            db.flush()
+        # End of process_batch
 
-        # Run process_batch in batches
-        for i in range(0, len(sheet["rows"]), BATCH_SIZE):
+        # Run process_batch in batches of 500, commit and print progress
+        BATCH_SIZE = 500
+        total_rows = len(sheet["rows"])
+        batch_num = 1
+        for i in range(0, total_rows, BATCH_SIZE):
             process_batch(sheet["rows"][i:i+BATCH_SIZE])
+            print(f"Processing {min(i + BATCH_SIZE, total_rows)} / {total_rows}")
+            db.flush()
+            db.commit()
+            print(f"Commit Batch {batch_num}")
+            batch_num += 1
 
         sheet_duration = time.time() - sheet_start_time
+        db_insert_duration = max(0.0, sheet_duration - dup_resolution_duration)
+        state.setdefault("db_insert_time", 0.0)
+        state["db_insert_time"] += db_insert_duration
 
         parsed_rows = len(sheet["rows"]) + sheet["blank_rows"]
         total_accounted = (sheet_inserted + sheet_updated + sheet_incomplete + 
@@ -1290,9 +1316,46 @@ class ImportService:
         print(f"rows updated: {state['updated_count']}")
         print(f"rows skipped: {state['skip_count']}")
         print(f"rows failed: {state['error_count']}")
+
+        # Timing report setup
+        parser_timings = parsed_wb.get("timings", {})
+        wb_load_time = parser_timings.get("workbook_load", 0.0)
+        hdr_det_time = parser_timings.get("header_detection", 0.0)
+        row_parse_time = parser_timings.get("row_parsing", 0.0)
+        dup_res_time = state.get("dup_resolution_time", 0.0)
+        db_ins_time = state.get("db_insert_time", 0.0)
+
         print("commit started")
+        t_commit_start = time.time()
         db.commit()
+        commit_time = time.time() - t_commit_start
         print("commit completed")
+
+        # Measure dashboard refresh timing
+        t_dash_start = time.time()
+        db.query(Trainee.status, func.count(Trainee.id)).group_by(Trainee.status).all()
+        dash_refresh_time = time.time() - t_dash_start
+
+        total_time = wb_load_time + hdr_det_time + row_parse_time + dup_res_time + db_ins_time + commit_time + dash_refresh_time
+
+        # Print timing report exactly as specified
+        print("Workbook Load")
+        print(f"{wb_load_time:.1f} sec")
+        print("Header Detection")
+        print(f"{hdr_det_time:.1f} sec")
+        print("Row Parsing")
+        print(f"{row_parse_time:.1f} sec")
+        print("Duplicate Resolution")
+        print(f"{dup_res_time:.1f} sec")
+        print("Database Insert")
+        print(f"{db_ins_time:.1f} sec")
+        print("Commit")
+        print(f"{commit_time:.1f} sec")
+        print("Dashboard Refresh")
+        print(f"{dash_refresh_time:.1f} sec")
+        print("Total")
+        print(f"{total_time:.1f} sec")
+
         # Print count after import
         count_after = db.query(Trainee).count()
         state["skipped_count"] = state["skip_count"]

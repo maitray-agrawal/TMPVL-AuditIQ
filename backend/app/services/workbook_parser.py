@@ -590,6 +590,8 @@ class WorkbookParser:
             "parser_version": "3.0.0",
           }
         """
+        import time
+        t_start = time.time()
         is_large_file = len(file_content) > 10 * 1024 * 1024
         file_io = io.BytesIO(file_content)
 
@@ -613,6 +615,7 @@ class WorkbookParser:
             except Exception as exc:
                 logger.warning(f"Could not open workbook for formula pass: {exc}")
 
+        wb_load_time = time.time() - t_start
         print("Workbook loaded")
         print(f"Sheet names: {wb_data.sheetnames}")
 
@@ -628,6 +631,9 @@ class WorkbookParser:
 
         parsed_sheets: List[Dict[str, Any]] = []
         formula_warn_emitted: set = set()   # per-workbook, per-sheet dedup
+
+        header_detection_duration = 0.0
+        row_parsing_duration = 0.0
 
         for sheet_name in wb_data.sheetnames:
             ws_data = wb_data[sheet_name]
@@ -647,6 +653,7 @@ class WorkbookParser:
                 continue
 
             try:
+                t_hdr_start = time.time()
                 # ── 3. Detect sheet type and header row ───────────────────────
                 sheet_type, confidence, header_idx, original_headers = (
                     cls.detect_sheet_type_and_header(ws_data)
@@ -711,12 +718,29 @@ class WorkbookParser:
                 else:
                     last_row_1based = ws_data.max_row or header_row_1based
 
+                header_detection_duration += time.time() - t_hdr_start
+
                 # ── 8. Parse data rows ────────────────────────────────────────
                 start_row = header_row_1based + 1
                 rows_data:  List[Dict[str, Any]] = []
                 blank_count = 0
                 valid_count = 0
 
+                # Pre-cache formula rows to avoid O(n^2) scanning inside the row loop
+                formula_rows_cache = []
+                if ws_formula_sheet is not None:
+                    try:
+                        formula_rows_cache = list(
+                            ws_formula_sheet.iter_rows(
+                                min_row=1,
+                                max_row=last_row_1based,
+                                values_only=True,
+                            )
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to cache formula rows: {e}")
+
+                t_row_start = time.time()
                 for r_idx, row in enumerate(
                     ws_data.iter_rows(
                         min_row=start_row,
@@ -734,21 +758,13 @@ class WorkbookParser:
                             val = cell.value
                         row_cells_data.append(val)
 
-                    # Build formula-pass cell list (same shape)
+                    # Build formula-pass cell list (same shape) from cache
                     row_cells_formula: List[Any] = []
-                    if ws_formula_sheet is not None:
-                        try:
-                            formula_row = next(
-                                ws_formula_sheet.iter_rows(
-                                    min_row=r_idx,
-                                    max_row=r_idx,
-                                    values_only=True,
-                                ),
-                                None,
-                            )
+                    if ws_formula_sheet is not None and formula_rows_cache:
+                        cache_idx = r_idx - 1
+                        if 0 <= cache_idx < len(formula_rows_cache):
+                            formula_row = formula_rows_cache[cache_idx]
                             row_cells_formula = list(formula_row) if formula_row else []
-                        except Exception:
-                            row_cells_formula = []
 
                     # Resolve each cell using dual-pass logic
                     row_resolved: List[Any] = []
@@ -810,6 +826,8 @@ class WorkbookParser:
                     rows_data.append(row_dict)
                     valid_count += 1
 
+                row_parsing_duration += time.time() - t_row_start
+
                 print(
                     f"Sheet '{sheet_name}': type={sheet_type}, "
                     f"header_row={header_row_1based}, "
@@ -852,6 +870,11 @@ class WorkbookParser:
             "stats":          stats,
             "sheets":         parsed_sheets,
             "parser_version": cls.PARSER_VERSION,
+            "timings": {
+                "workbook_load": wb_load_time,
+                "header_detection": header_detection_duration,
+                "row_parsing": row_parsing_duration,
+            }
         }
 
     # -------------------------------------------------------------------------
@@ -907,7 +930,8 @@ def _is_numeric(s: str) -> bool:
 
 def _sheet_is_empty(ws) -> bool:
     """Return True when every cell in the worksheet is None or blank."""
-    for row in ws.iter_rows(values_only=True):
+    # Optimize: only scan the first 10 rows to detect empty sheet
+    for row in ws.iter_rows(max_row=10, values_only=True):
         for cell in row:
             if cell is not None:
                 val_str = str(cell).strip()
